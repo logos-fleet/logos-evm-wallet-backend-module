@@ -233,7 +233,12 @@ fn fetch_chain_async(
 ) {
     if let Some(mc) = multicall {
         if let Some(call_json) = build_multicall_call_json(&mc, holder, &tokens) {
-            modules().eth_rpc_module.call_async(chain_id as i64, &call_json, move |res| {
+            // `None` for the deadline: eth_rpc's `call` takes the CALLER's own wall
+            // budget, and this module has none — the refresh is driven by a user opening
+            // a screen, not by a deadline it could state. Absent leaves the chain's
+            // configured `timeoutSecs` in charge, which is exactly the behaviour this
+            // fan-out had before the parameter existed.
+            modules().eth_rpc_module.call_async(chain_id as i64, &call_json, None, move |res| {
                 done(decode_multicall_chain(chain_id, &tokens, res.ok()));
             });
             return;
@@ -263,7 +268,7 @@ fn fetch_chain_individual_async(
         tasks.push(Box::new(move |d| {
             modules()
                 .eth_rpc_module
-                .call_async(chain_id as i64, &call_json, move |res| d((slot, decode_call_balance_reply(res.ok()))));
+                .call_async(chain_id as i64, &call_json, None, move |res| d((slot, decode_call_balance_reply(res.ok()))));
         }));
     }
     gather(tasks, move |parts: Vec<(usize, U256)>| {
