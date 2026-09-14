@@ -635,7 +635,10 @@ impl WalletBackendModuleImpl {
         let fetched = ok_value(
             modules().keystore_module.fetch_result(request_id, &receipt).map_err(|e| e.to_string())?,
         )?;
-        let sigs: Vec<String> = fetched["results"]
+        // `signed`, which is what `fetch_result` answers: `{ ok, signed: [...] }`.
+        // Reading `results` collected nothing, every time, and no doctest caught it
+        // because they all stop at the approval.
+        let sigs: Vec<String> = fetched["signed"]
             .as_array()
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
