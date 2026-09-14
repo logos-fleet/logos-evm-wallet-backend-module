@@ -256,7 +256,7 @@ sections:
           HASH=$(cast call --rpc-url $RPC $FACTORY "pairInitCodeHash()(bytes32)")
           printf '[ { "chainId": 11155111, "name": "Anvil", "rpcUrl": "%s", "nativeSymbol": "ETH", "multicall3": "%s" } ]\n' "$RPC" "$MC" > chains.json
           printf '{ "phrase": "test test test test test test test test test test test junk", "accountIndex": 0, "password": "pw" }\n' > mnemonic.json
-          printf '{ "approver": "signer_ui", "custodian": "wallet_backend_module" }\n' > roles.json
+          printf '{ "approvers": "evm_signer_ui", "custodians": "wallet_backend_module" }\n' > roles.json
           printf '[ "%s" ]\n' "$TKN" > watch.json
           printf '{ "chainId": 11155111, "weth": "%s", "stablecoins": ["%s"], "multicall3": "%s", "v2Factory": "%s", "v2InitCodeHash": "%s" }\n' "$WETH" "$USDC" "$MC" "$FACTORY" "$HASH" > uni.json
           printf '{ "from": "%s", "to": "0x70997970C51812dc3A010C7d01b50e0d17dc79C8", "chainId": 11155111, "amount": "0xde0b6b3a7640000" }\n' "$ACC0" > send.json
@@ -304,11 +304,11 @@ sections:
       - title: "Name the custodian before importing (keystore Tier D)"
         text: |
           Importing a key is Tier D: it belongs to the CUSTODIAN alone, and the built-in
-          default is `keystore_ui`, which this daemon does not run — so the import below
+          default is `evm_keystore_ui`, which this daemon does not run — so the import below
           would be refused until someone says who holds the role.
 
           `configure` is TOTAL: a role it does not name is held by NOBODY, not left at its
-          default. So this names both, and `approver` deliberately stays `signer_ui` —
+          default. So this names both, and `approvers` deliberately stays `evm_signer_ui` —
           no approver runs here, which is exactly what the approval steps prove.
         run: "./logos/bin/logoscore call keystore_module configure @roles.json"
         code_block: "logoscore call keystore_module configure @roles.json"
@@ -416,7 +416,7 @@ sections:
           It used to prove that a real, signed EIP-1559 transaction was accepted
           and mined by Anvil. It cannot prove that any more: the wallet has no
           key and no `sign_*` to call, so nothing reaches the chain without an
-          approver, and Tier A admits only `module:signer_ui` — a `logoscore`
+          approver, and Tier A admits only `module:evm_signer_ui` — a `logoscore`
           caller is refused there by design.
 
           Everything up to the signature is still exercised against a real
