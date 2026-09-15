@@ -157,8 +157,9 @@
               echo "      door (hasOutboundDoor). Force the workspace flake, whose"
               echo "      pins do carry it -- a bare --auto-local on a clean tree"
               echo "      builds this module's own lock and lands back here:"
-              echo "        ws test logos-evm-wallet-backend-module \"
-              echo "             --local logos-evm-wallet-backend-module"
+              # One line, no continuation: a trailing backslash inside a nix
+              # indented string reaches bash as an unterminated quote.
+              echo "        ws test logos-evm-wallet-backend-module --local logos-evm-wallet-backend-module"
               mkdir -p $out
               echo skipped > $out/result
             '';
