@@ -267,20 +267,20 @@ impl Call {
     fn invoke_async(self, done: impl FnOnce(std::result::Result<String, String>) + Send + 'static) {
         let m = modules();
         match self {
-            Call::EthVerifyChainId(c) => m.eth_rpc_module.verify_chain_id_async(c, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::EthTransactionCount(c, a) => m.eth_rpc_module.get_transaction_count_async(c, &a, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::EthEstimateGas(c, tx) => m.eth_rpc_module.estimate_gas_async(c, &tx, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::EthSendRawTransaction(c, raw) => m.eth_rpc_module.send_raw_transaction_async(c, &raw, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::EthTransactionReceipt(c, h) => m.eth_rpc_module.get_transaction_receipt_async(c, &h, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::KeystoreRequestApproval(i) => m.keystore_module.request_approval_async(&i, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::KeystoreApprovalStatus(h, r2) => m.keystore_module.approval_status_async(&h, &r2, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::KeystoreFetchResult(h, r2) => m.keystore_module.fetch_result_async(&h, &r2, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::KeystoreAckResult(h, r2) => m.keystore_module.ack_result_async(&h, &r2, move |r| done(r.map(|b| b.to_string()).map_err(|e| e.to_string()))),
-            Call::KeystoreImportMnemonic(p) => m.keystore_module.import_mnemonic_async(&p, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::KeystoreListAccounts => m.keystore_module.list_accounts_async(move |r| done(r.map_err(|e| e.to_string()))),
-            Call::TokenListGetTokens(c) => m.token_list_module.get_tokens_async(c, move |r| done(r.map_err(|e| e.to_string()))),
-            Call::TokenListAddCustomToken(t) => m.token_list_module.add_custom_token_async(&t, move |r| done(r.map(|b| b.to_string()).map_err(|e| e.to_string()))),
-            Call::FeeEstimate(c, r2) => m.fee_module.estimate_async(c, &r2, move |r| done(r.map_err(|e| e.to_string()))),
+            Call::EthVerifyChainId(c) => m.eth_rpc_module.verify_chain_id_async(c, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthTransactionCount(c, a) => m.eth_rpc_module.get_transaction_count_async(c, &a, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthEstimateGas(c, tx) => m.eth_rpc_module.estimate_gas_async(c, &tx, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthSendRawTransaction(c, raw) => m.eth_rpc_module.send_raw_transaction_async(c, &raw, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthTransactionReceipt(c, h) => m.eth_rpc_module.get_transaction_receipt_async(c, &h, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreRequestApproval(i) => m.keystore_module.request_approval_async(&i, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreApprovalStatus(h, r) => m.keystore_module.approval_status_async(&h, &r, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreFetchResult(h, r) => m.keystore_module.fetch_result_async(&h, &r, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreAckResult(h, r) => m.keystore_module.ack_result_async(&h, &r, move |res| done(res.map(|b| b.to_string()).map_err(|e| e.to_string()))),
+            Call::KeystoreImportMnemonic(p) => m.keystore_module.import_mnemonic_async(&p, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreListAccounts => m.keystore_module.list_accounts_async(move |res| done(res.map_err(|e| e.to_string()))),
+            Call::TokenListGetTokens(c) => m.token_list_module.get_tokens_async(c, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::TokenListAddCustomToken(t) => m.token_list_module.add_custom_token_async(&t, move |res| done(res.map(|b| b.to_string()).map_err(|e| e.to_string()))),
+            Call::FeeEstimate(c, r) => m.fee_module.estimate_async(c, &r, move |res| done(res.map_err(|e| e.to_string()))),
         }
     }
 }
@@ -1247,8 +1247,7 @@ impl WalletBackendModuleImpl {
                 held.push((addr.to_string(), dec));
             }
 
-            // Ask Uniswap for prices (held tokens; module adds stablecoins itself).
-            let prices = self.uniswap_prices(chain_id as i64, &held);
+            let prices = self.cached_prices(chain_id);
 
             // Native ETH item.
             let native_bal = chain.get("native").and_then(Value::as_str).unwrap_or("0");
@@ -1301,14 +1300,13 @@ impl WalletBackendModuleImpl {
             .unwrap_or_default()
     }
 
-    /// Ask `uniswap_module` for token→(eth, usd) prices, keyed by the address
-    /// string we passed (plus an `"ETH"` entry for native). Empty on failure.
-    /// Read the cached per-chain prices that `refresh_market` populated. `held` is
-    /// unused now — the cache already holds every priced token for the chain.
-    fn uniswap_prices(&mut self, chain_id: i64, _held: &[(String, u8)]) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+    /// The token→(eth, usd) prices `refresh_market` cached for a chain, keyed by
+    /// the address string it priced (plus an `"ETH"` entry for native). Empty
+    /// until the fan-out has run, which prices every holding at `null`.
+    fn cached_prices(&mut self, chain_id: u64) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
         self.st()
             .ok()
-            .and_then(|st| st.market_prices.lock().unwrap().get(&(chain_id as u64)).cloned())
+            .and_then(|st| st.market_prices.lock().unwrap().get(&chain_id).cloned())
             .unwrap_or_default()
     }
 
@@ -1360,6 +1358,13 @@ impl WalletBackendModuleImpl {
             fee: None,
             gas_limit: default_gas,
         })
+    }
+
+    /// Parse a native send request and plan it. Shared by the two spellings of
+    /// `send_native`, which differ only in how they drive the flow.
+    fn plan_send_native(&mut self, send_json: &str) -> std::result::Result<SendFlow, String> {
+        let p: SendParams = serde_json::from_str(send_json).map_err(|e| e.to_string())?;
+        self.plan_send(&p, None)
     }
 
     /// Parse an ERC-20 send request and plan it. Shared by the two spellings of
@@ -1774,27 +1779,14 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn send_native(&mut self, send_json: String) -> String {
-        let p: SendParams = match serde_json::from_str(&send_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        match self.plan_send(&p, None) {
+        match self.plan_send_native(&send_json) {
             Ok(flow) => answer(flow, "start_send_native"),
             Err(e) => err(e),
         }
     }
 
     fn send_erc20(&mut self, send_json: String) -> String {
-        let p: SendParams = match serde_json::from_str(&send_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        let token = match parse_addr(&p.token_address) {
-            Ok(a) => a,
-            Err(e) => return err(e),
-        };
-        let amount = parse_u256_str(&p.amount);
-        match self.plan_send(&p, Some((token, amount))) {
+        match self.plan_send_erc20(&send_json) {
             Ok(flow) => answer(flow, "start_send_erc20"),
             Err(e) => err(e),
         }
@@ -1845,7 +1837,7 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn start_send_native(&mut self, send_json: String) -> String {
-        match serde_json::from_str::<SendParams>(&send_json).map_err(|e| e.to_string()).and_then(|p| self.plan_send(&p, None)) {
+        match self.plan_send_native(&send_json) {
             Ok(flow) => start_flow(flow),
             Err(e) => err(e),
         }

@@ -265,7 +265,7 @@ function drainStartupConfigs(image, grant) {
      'start_send_native'],
   ]) {
     const refused = a.json(method, args);
-    if (refused.ok !== false || !new RegExp(twin).test(refused.error || '')) {
+    if (refused.ok !== false || !(refused.error || '').includes(twin)) {
       fail(method + ' did not refuse on wasm naming ' + twin + ': ' + JSON.stringify(refused));
     }
   }

@@ -150,16 +150,19 @@
           web-variant =
             if modulePkgs ? web
             then import ./nix/web-variant-test.nix { inherit pkgs; webVariant = modulePkgs.web; }
+            # A quoted heredoc, so the message needs no shell escaping: a
+            # backtick or a line continuation inside a nix indented string
+            # otherwise reaches bash and breaks the quoting.
             else pkgs.runCommand "wallet-backend-web-variant-tests-skipped" { } ''
-              echo "SKIP: web-variant -- this pin publishes no \`web\` output for"
-              echo "      wallet_backend_module. A module with dependencies gets one"
-              echo "      only when logos-protocol's wasm subset carries the outbound"
-              echo "      door (hasOutboundDoor). Force the workspace flake, whose"
-              echo "      pins do carry it -- a bare --auto-local on a clean tree"
-              echo "      builds this module's own lock and lands back here:"
-              # One line, no continuation: a trailing backslash inside a nix
-              # indented string reaches bash as an unterminated quote.
-              echo "        ws test logos-evm-wallet-backend-module --local logos-evm-wallet-backend-module"
+              cat <<'SKIP'
+              SKIP: web-variant -- this pin publishes no `web` output for
+                    wallet_backend_module. A module with dependencies gets one
+                    only when logos-protocol's wasm subset carries the outbound
+                    door (hasOutboundDoor). Force the workspace flake, whose
+                    pins do carry it -- a bare --auto-local on a clean tree
+                    builds this module's own lock and lands back here:
+                      ws test logos-evm-wallet-backend-module --local logos-evm-wallet-backend-module
+              SKIP
               mkdir -p $out
               echo skipped > $out/result
             '';
