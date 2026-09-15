@@ -52,13 +52,24 @@
       # out of `systems` above for the reason the builder keeps them out of its
       # own: a phone gets the Bare image and none of the other outputs.
       #
-      # THIS IS WHAT MAKES wallet_backend BUNDLABLE (#148). A phone's Bundled
+      # THE PREREQUISITE FOR BUNDLING wallet_backend (#148). A phone's Bundled
       # set is resolved out of a catalog whose every entry is a module's own
       # `mobile.<target>.bare`, so a module with no mobile output cannot be in
-      # that set however well it builds on a desktop — and the wallet UI's `web`
-      # variant then has nothing to ask for a fee, a send or a history, which is
-      # why its Send and History tabs printed "wallet_backend_module ... has no
+      # that set however well it builds on a desktop — which is why the wallet
+      # UI's `web` variant had nothing to ask for a fee, a send or a history,
+      # and its Send and History tabs printed "wallet_backend_module ... has no
       # mobile build".
+      #
+      # IT IS NOT THE WHOLE OF IT, and this flake cannot be. `--bundle
+      # wallet_backend_module` resolves a CLOSURE, and two of the five
+      # dependencies in it do not cross yet: keystore_module publishes no mobile
+      # targets at all, and fee_module is not a workspace repo. So
+      # logos-basecamp's mobile catalog carries no wallet_backend_module entry
+      # — eth_rpc_module, token_list_module and uniswap_module are in it and
+      # this module is deliberately not — and it must not gain one before those
+      # two land: a catalog entry whose closure cannot be resolved is a BROKEN
+      # Bundled set rather than a missing one. What this flake does is stop
+      # being the piece that is missing; the catalog entry is a later one.
       #
       # NOTHING HAD TO CHANGE IN THE MODULE to cross, and that is the point of
       # this being a one-line absence rather than a port. This crate is the
@@ -89,13 +100,14 @@
       legacyPackages = module.legacyPackages or { };
 
       # THE MODULE'S OWN ANSWER ABOUT ITSELF, forwarded so a consumer flake can
-      # read it without building anything. logos-basecamp's mobile catalog takes
-      # this module's `version` and, above all, its `dependencies` from here
-      # rather than restating them: a Bundled set resolves a CLOSURE out of the
-      # catalog entry, so `--bundle wallet_backend_module` has to pull
-      # eth_rpc_module, keystore_module, token_list_module, uniswap_module and
-      # fee_module in without naming any of them — and a hand-copied list in a
-      # SIGNED manifest is a claim the core would act on after it had drifted.
+      # read it without building anything. When logos-basecamp's mobile catalog
+      # gains a wallet_backend_module entry it takes this module's `version`
+      # and, above all, its `dependencies` from here rather than restating them:
+      # a Bundled set resolves a CLOSURE out of the catalog entry, so `--bundle
+      # wallet_backend_module` has to pull eth_rpc_module, keystore_module,
+      # token_list_module, uniswap_module and fee_module in without naming any
+      # of them — and a hand-copied list in a SIGNED manifest is a claim the
+      # core would act on after it had drifted.
       # `configFor` is the per-target resolution of the same document; this
       # module has no `platforms` overlay, so the two agree everywhere.
       inherit (module) config configFor;
