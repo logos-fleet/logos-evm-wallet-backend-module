@@ -38,14 +38,66 @@
     let
       nixpkgs = logos-module-builder.inputs.nixpkgs;
       systems = [ "aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux" ];
-      forAllSystems = f: nixpkgs.lib.genAttrs systems f;
+
+      # ONE module, answered for every target at once — mkLogosModule already
+      # keys its own outputs by system, so calling it inside a genAttrs would
+      # evaluate the same module once per target and throw all but one away.
+      module = logos-module-builder.lib.mkLogosModule {
+        src = ./.;
+        configFile = ./metadata.json;
+        flakeInputs = inputs;
+      };
+
+      # The mobile pseudo-systems logos-nix keys its cross package sets by. Kept
+      # out of `systems` above for the reason the builder keeps them out of its
+      # own: a phone gets the Bare image and none of the other outputs.
+      #
+      # THIS IS WHAT MAKES wallet_backend BUNDLABLE (#148). A phone's Bundled
+      # set is resolved out of a catalog whose every entry is a module's own
+      # `mobile.<target>.bare`, so a module with no mobile output cannot be in
+      # that set however well it builds on a desktop — and the wallet UI's `web`
+      # variant then has nothing to ask for a fee, a send or a history, which is
+      # why its Send and History tabs printed "wallet_backend_module ... has no
+      # mobile build".
+      #
+      # NOTHING HAD TO CHANGE IN THE MODULE to cross, and that is the point of
+      # this being a one-line absence rather than a port. This crate is the
+      # OFFLINE half of the wallet: `alloy` with default features off
+      # (`std` + `sol-types`) for ABI encoding and 256-bit arithmetic, plus
+      # hex/serde/serde_json. It opens no socket and signs nothing itself — every
+      # chain read goes out through `modules().eth_rpc_module` and every
+      # signature through `modules().keystore_module`, both of which are
+      # module-to-module calls the phone's native transport already carries. So
+      # there is no C dependency, no TLS stack and no `nix.external_libraries`
+      # to cross, on either phone.
+      #
+      # `? ${t}` rather than a bare index, so a logos-module-builder pin without
+      # the mobile cross sets leaves this flake simply WITHOUT mobile keys
+      # instead of failing to evaluate.
+      mobileTargets = builtins.filter (t: module.packages ? ${t})
+        [ "aarch64-ios" "aarch64-ios-simulator" "aarch64-android" ];
     in
     {
-      packages = forAllSystems (system:
-        (logos-module-builder.lib.mkLogosModule {
-          src = ./.;
-          configFile = ./metadata.json;
-          flakeInputs = inputs;
-        }).packages.${system});
+      packages = nixpkgs.lib.genAttrs (systems ++ mobileTargets)
+        (target: module.packages.${target});
+
+      # An Android cross derivation's `system` is its BUILD platform, so
+      # `packages.aarch64-android` is pinned to the builder's canonical one
+      # (x86_64-linux) and a Mac cannot realise it. The same artifact, reached
+      # from whichever machine is doing the building:
+      #   nix build .#legacyPackages.aarch64-darwin.mobile.aarch64-android.bare
+      legacyPackages = module.legacyPackages or { };
+
+      # THE MODULE'S OWN ANSWER ABOUT ITSELF, forwarded so a consumer flake can
+      # read it without building anything. logos-basecamp's mobile catalog takes
+      # this module's `version` and, above all, its `dependencies` from here
+      # rather than restating them: a Bundled set resolves a CLOSURE out of the
+      # catalog entry, so `--bundle wallet_backend_module` has to pull
+      # eth_rpc_module, keystore_module, token_list_module, uniswap_module and
+      # fee_module in without naming any of them — and a hand-copied list in a
+      # SIGNED manifest is a claim the core would act on after it had drifted.
+      # `configFor` is the per-target resolution of the same document; this
+      # module has no `platforms` overlay, so the two agree everywhere.
+      inherit (module) config configFor;
     };
 }
