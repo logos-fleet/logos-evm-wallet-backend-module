@@ -9,7 +9,22 @@
 //! sends are built (alloy) → signed (keystore) → broadcast (eth_rpc) → recorded.
 //!
 //! Compiled only with the default `logos_module` feature; the pure cores
-//! (`txbuild`, `config`, `history`) are tested with `cargo test --no-default-features`.
+//! (`txbuild`, `config`, `history`, `jobs`) are tested with
+//! `cargo test --no-default-features`.
+//!
+//! ## Two spellings for every method that leaves the process
+//!
+//! A `web` (wasm) image has one Worker and one event loop and cannot wait for a
+//! reply (ADR 0004), so every outbound call site here is written once as a
+//! `Flow` — a state machine over `Call` values — and driven two ways. See the
+//! block below `include!` for why the native path keeps its SYNCHRONOUS clients
+//! rather than following `uniswap_module` onto "dispatch and wait".
+//!
+//!   `<method>`         answers directly, having waited. NATIVE ONLY; on a `web`
+//!                      image it dispatches nothing and names its twin.
+//!   `start_<method>`   answers `{ok, jobId}` at once. Works everywhere, and it
+//!                      is the spelling a `web` image must use.
+//!   `take_result(id)`  collects a `start_*` job, once.
 
 use alloy::primitives::{Address, U256};
 use serde::Deserialize;
@@ -18,6 +33,7 @@ use std::sync::Arc; // `Mutex` is already in scope from the generated provider g
 
 use crate::config::{ChainInfo, ConfigStore, ProxySettings};
 use crate::history::{now_secs, History, TxRecord};
+use crate::jobs::{self, Job, JobBoard};
 use crate::{txbuild, txbuild::Fee};
 
 pub trait WalletBackendModule: Send + 'static {
@@ -26,15 +42,26 @@ pub trait WalletBackendModule: Send + 'static {
     fn get_proxy_config(&mut self) -> String;
     fn set_chains(&mut self, chains_json: String) -> bool;
     fn get_chains(&mut self) -> String;
+    /// Ask eth_rpc whether the configured endpoint really is this chain.
+    ///
+    /// Waits for the reply, so it answers directly. NOT AVAILABLE on a `web`
+    /// (wasm) image — use [`Self::start_test_endpoint`] + [`Self::take_result`],
+    /// which work everywhere.
     fn test_endpoint(&mut self, chain_id: i64) -> String;
 
     // ── accounts (signing stays in the keystore) ──
+    /// Import a mnemonic into the keystore and label the account it answers.
+    /// Waits for the reply; see [`Self::start_import_mnemonic`].
     fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String;
+    /// The keystore's accounts. Waits for the reply; see
+    /// [`Self::start_list_accounts`].
     fn list_accounts(&mut self) -> String;
     /// Drive a parked signing request forward: `{ ok, state, hash?, reason? }`.
     /// `state` is `awaiting_approval` until a human decides. There is no
     /// `unlock`/`lock` any more — the wallet never handles a vault password,
     /// and there is no unlocked state for it to toggle.
+    ///
+    /// Waits for each of its replies; see [`Self::start_send_status`].
     fn send_status(&mut self, request_id: String) -> String;
 
     // ── watched tokens ──
@@ -42,28 +69,84 @@ pub trait WalletBackendModule: Send + 'static {
     fn get_watched_tokens(&mut self, chain_id: i64) -> String;
 
     // ── tokens passthrough ──
+    /// token_list's catalogue for a chain. Waits for the reply; see
+    /// [`Self::start_get_tokens`].
     fn get_tokens(&mut self, chain_id: i64) -> String;
+    /// Add a token to token_list's catalogue. Waits for the reply; see
+    /// [`Self::start_add_custom_token`]. `false` on a `web` image, which cannot
+    /// wait — there is no third answer a `bool` can carry, which is why the
+    /// `start_*` twin exists.
     fn add_custom_token(&mut self, token_json: String) -> bool;
 
     // ── balances (Multicall3-batched) ──
+    /// Fan out one balance read per chain and return AT ONCE; the cache is
+    /// written and `balances_updated` emitted when the last reply lands. Async
+    /// since before this port, so it works unchanged on every target.
     fn refresh_balances(&mut self, address: String) -> bool;
     fn get_balances(&mut self, address: String) -> String;
 
     // ── market (Uniswap prices for held tokens) ──
+    /// The last refreshed market view. Offline on every target: it reads the
+    /// prices and the token metadata that `refresh_market` cached.
     fn get_market(&mut self, address: String) -> String;
-    /// Refresh prices for held tokens across all chains concurrently (fans out one
-    /// `uniswap.get_prices` per chain), caches them, and emits `market_updated`.
-    /// `get_market` then reads the cache. Returns immediately.
+    /// Refresh prices for held tokens across all chains concurrently (per chain:
+    /// `token_list.get_tokens` for the decimals, then one `uniswap.get_prices`),
+    /// caches both, and emits `market_updated`. `get_market` then reads the
+    /// cache. Returns immediately, on every target.
     fn refresh_market(&mut self, address: String) -> bool;
 
     // ── send ──
+    /// Quote a send's fee through fee_module. Waits for the reply; see
+    /// [`Self::start_estimate_fee`].
     fn estimate_fee(&mut self, send_json: String) -> String;
+    /// Build a native send and put it in front of a human: nonce → fee → gas →
+    /// `keystore.request_approval`, answering `{ ok, pending, requestId }`.
+    /// Waits for each reply; see [`Self::start_send_native`].
     fn send_native(&mut self, send_json: String) -> String;
+    /// [`Self::send_native`] for an ERC-20 transfer. See
+    /// [`Self::start_send_erc20`].
     fn send_erc20(&mut self, send_json: String) -> String;
 
     // ── history ──
     fn get_history(&mut self, address: String) -> String;
+    /// Poll a broadcast tx's receipt and update its history record. Waits for
+    /// the reply; see [`Self::start_refresh_tx_status`].
     fn refresh_tx_status(&mut self, hash_hex: String, chain_id: i64) -> String;
+
+    // ── the async spelling: `start_*` + `take_result` ──
+    //
+    // The shape the platform actually has, EVERYWHERE, and the only one a `web`
+    // (wasm) image can use: each `start_*` issues its first outbound call and
+    // answers `{ ok, jobId }` at once; the answer its waiting twin would have
+    // returned is parked on the job board and collected with `take_result`.
+
+    /// [`Self::test_endpoint`] without waiting.
+    fn start_test_endpoint(&mut self, chain_id: i64) -> String;
+    /// [`Self::import_mnemonic`] without waiting.
+    fn start_import_mnemonic(&mut self, phrase_json: String, label: String) -> String;
+    /// [`Self::list_accounts`] without waiting.
+    fn start_list_accounts(&mut self) -> String;
+    /// [`Self::get_tokens`] without waiting.
+    fn start_get_tokens(&mut self, chain_id: i64) -> String;
+    /// [`Self::add_custom_token`] without waiting. The job answers
+    /// `{ ok: true, added: bool }` — the `bool` its twin returns, plus the
+    /// room to report a transport failure that a bare `bool` has nowhere to put.
+    fn start_add_custom_token(&mut self, token_json: String) -> String;
+    /// [`Self::estimate_fee`] without waiting.
+    fn start_estimate_fee(&mut self, send_json: String) -> String;
+    /// [`Self::send_native`] without waiting.
+    fn start_send_native(&mut self, send_json: String) -> String;
+    /// [`Self::send_erc20`] without waiting.
+    fn start_send_erc20(&mut self, send_json: String) -> String;
+    /// [`Self::send_status`] without waiting.
+    fn start_send_status(&mut self, request_id: String) -> String;
+    /// [`Self::refresh_tx_status`] without waiting.
+    fn start_refresh_tx_status(&mut self, hash_hex: String, chain_id: i64) -> String;
+    /// Collect a `start_*` job: `{ok:false, pending:true}` while its calls are
+    /// in flight, then the answer — ONCE. A second collect, an id that was never
+    /// started, and one evicted at `jobs::CAPACITY` all report an error, so a
+    /// poller is never left waiting on a slot that will never fill.
+    fn take_result(&mut self, job_id: String) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -77,14 +160,273 @@ pub trait WalletBackendModuleEvents {
 
 include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 
+// ── THE OUTBOUND CALLS, AND THE TWO WAYS TO DRIVE THEM ───────────────────────
+//
+// This module is the wallet's COORDINATOR: nearly every method it has is one or
+// more calls to a dependency, and several of them are a CHAIN — a nonce, then a
+// fee derived from nothing, then a gas estimate over a tx built from both, then
+// a human. That chain is the reason this file looks the way it does.
+//
+// A `web` (wasm) image can only make those calls with the generated `_async`
+// clients. A Worker is a single event loop with no ASYNCIFY (ADR 0004), so a
+// call that blocked for its reply would deadlock the loop that delivers it, and
+// logos-rust-sdk does not compile the synchronous `lp_invoke` on that target at
+// all — a missed call site is a compile error here rather than an undefined
+// symbol at wasm-ld.
+//
+// THE NATIVE PATH KEEPS ITS SYNCHRONOUS CLIENTS, and that is a decision, not an
+// omission. `uniswap_module` (#167) could rewrite its one call site to
+// "dispatch async, wait on a channel" because it is `concurrency: "multi"`: its
+// dispatch runs on a worker QThread while the completion is marshalled onto the
+// consumer's owner thread (the Qt main thread), so the thread that waits is
+// never the thread that must deliver. THIS module is `concurrency: "single"` —
+// dispatch IS the Qt main thread — so the same rewrite would deadlock every
+// method it touched. The synchronous client, which spins its own wait, is the
+// correct spelling here and stays.
+//
+// So each flow is written ONCE, as a state machine over `Call` values, and
+// DRIVEN TWICE:
+//
+//   run_waiting  native only. Issue each call with the synchronous client and
+//                feed the reply back in, in a loop. Same calls, same order,
+//                same answers as the straight-line code this replaces.
+//   drive        everywhere. Issue each call with the `_async` client and feed
+//                the reply back in from the callback; park the answer on the
+//                job board for `take_result`.
+//
+// REPLIES ARE NOT ORDERED, which is exactly why a flow is a state machine and
+// not a fan-out: every call in a chain is issued only once its predecessor's
+// reply is in hand, so there is never more than one of a flow's calls in flight
+// and nothing here can be confused by arrival order. The two places this module
+// DOES fan out — `refresh_balances` and `refresh_market` — collect with
+// `gather`, which is order-independent by construction (each task writes its own
+// slot).
+
+/// Answers parked while their outbound calls are in flight.
+///
+/// A `static`, not a field on the impl: the callback an async client takes is
+/// `FnOnce + Send + 'static` and cannot borrow the module. That is true of every
+/// async callback in the SDK, not a property of this module.
+static JOBS: JobBoard = JobBoard::new();
+
+/// One outbound call to a dependency, described BY VALUE so that the same
+/// description can be issued either way.
+///
+/// Every reply is normalised to `Result<String, String>`; the two `bool`-valued
+/// methods answer `"true"` / `"false"`, which is what a flow would read back out
+/// of JSON anyway, so no flow has to know which shape its dependency happens to
+/// use.
+enum Call {
+    EthVerifyChainId(i64),
+    EthTransactionCount(i64, String),
+    EthEstimateGas(i64, String),
+    EthSendRawTransaction(i64, String),
+    EthTransactionReceipt(i64, String),
+    KeystoreRequestApproval(String),
+    KeystoreApprovalStatus(String, String),
+    KeystoreFetchResult(String, String),
+    KeystoreAckResult(String, String),
+    KeystoreImportMnemonic(String),
+    KeystoreListAccounts,
+    TokenListGetTokens(i64),
+    TokenListAddCustomToken(String),
+    FeeEstimate(i64, String),
+}
+
+impl Call {
+    /// Issue this call and WAIT for its answer, with the synchronous client.
+    ///
+    /// Native only — `lp_invoke` does not exist on wasm32 and the generated sync
+    /// clients are `#[cfg(not(target_os = "emscripten"))]` accordingly.
+    #[cfg(not(target_os = "emscripten"))]
+    fn invoke_waiting(self) -> std::result::Result<String, String> {
+        let m = modules();
+        match self {
+            Call::EthVerifyChainId(c) => m.eth_rpc_module.verify_chain_id(c).map_err(|e| e.to_string()),
+            Call::EthTransactionCount(c, a) => m.eth_rpc_module.get_transaction_count(c, &a).map_err(|e| e.to_string()),
+            Call::EthEstimateGas(c, tx) => m.eth_rpc_module.estimate_gas(c, &tx).map_err(|e| e.to_string()),
+            Call::EthSendRawTransaction(c, raw) => m.eth_rpc_module.send_raw_transaction(c, &raw).map_err(|e| e.to_string()),
+            Call::EthTransactionReceipt(c, h) => m.eth_rpc_module.get_transaction_receipt(c, &h).map_err(|e| e.to_string()),
+            Call::KeystoreRequestApproval(i) => m.keystore_module.request_approval(&i).map_err(|e| e.to_string()),
+            Call::KeystoreApprovalStatus(h, r) => m.keystore_module.approval_status(&h, &r).map_err(|e| e.to_string()),
+            Call::KeystoreFetchResult(h, r) => m.keystore_module.fetch_result(&h, &r).map_err(|e| e.to_string()),
+            Call::KeystoreAckResult(h, r) => m.keystore_module.ack_result(&h, &r).map(|b| b.to_string()).map_err(|e| e.to_string()),
+            Call::KeystoreImportMnemonic(p) => m.keystore_module.import_mnemonic(&p).map_err(|e| e.to_string()),
+            Call::KeystoreListAccounts => m.keystore_module.list_accounts().map_err(|e| e.to_string()),
+            Call::TokenListGetTokens(c) => m.token_list_module.get_tokens(c).map_err(|e| e.to_string()),
+            Call::TokenListAddCustomToken(t) => m.token_list_module.add_custom_token(&t).map(|b| b.to_string()).map_err(|e| e.to_string()),
+            Call::FeeEstimate(c, r) => m.fee_module.estimate(c, &r).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Issue this call and hand its answer to `done`, with the `_async` client.
+    ///
+    /// `done` runs on the protocol's completion path, not on the thread that
+    /// called this, which is why it is `Send + 'static` and carries everything
+    /// it needs by value.
+    fn invoke_async(self, done: impl FnOnce(std::result::Result<String, String>) + Send + 'static) {
+        let m = modules();
+        match self {
+            Call::EthVerifyChainId(c) => m.eth_rpc_module.verify_chain_id_async(c, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthTransactionCount(c, a) => m.eth_rpc_module.get_transaction_count_async(c, &a, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthEstimateGas(c, tx) => m.eth_rpc_module.estimate_gas_async(c, &tx, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthSendRawTransaction(c, raw) => m.eth_rpc_module.send_raw_transaction_async(c, &raw, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::EthTransactionReceipt(c, h) => m.eth_rpc_module.get_transaction_receipt_async(c, &h, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreRequestApproval(i) => m.keystore_module.request_approval_async(&i, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreApprovalStatus(h, r) => m.keystore_module.approval_status_async(&h, &r, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreFetchResult(h, r) => m.keystore_module.fetch_result_async(&h, &r, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreAckResult(h, r) => m.keystore_module.ack_result_async(&h, &r, move |res| done(res.map(|b| b.to_string()).map_err(|e| e.to_string()))),
+            Call::KeystoreImportMnemonic(p) => m.keystore_module.import_mnemonic_async(&p, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::KeystoreListAccounts => m.keystore_module.list_accounts_async(move |res| done(res.map_err(|e| e.to_string()))),
+            Call::TokenListGetTokens(c) => m.token_list_module.get_tokens_async(c, move |res| done(res.map_err(|e| e.to_string()))),
+            Call::TokenListAddCustomToken(t) => m.token_list_module.add_custom_token_async(&t, move |res| done(res.map(|b| b.to_string()).map_err(|e| e.to_string()))),
+            Call::FeeEstimate(c, r) => m.fee_module.estimate_async(c, &r, move |res| done(res.map_err(|e| e.to_string()))),
+        }
+    }
+}
+
+/// What a flow wants next: one more outbound call, or its answer.
+enum Step {
+    Call(Call),
+    Done(String),
+}
+
+/// A method's outbound work as a state machine — written once, driven twice.
+///
+/// `Send + 'static` because the async driver hands the flow to a callback; the
+/// module state a flow needs after its last reply (the pending-job map, the
+/// history store, the persistence dir) is carried in by `Arc`, never borrowed.
+trait Flow: Send + 'static {
+    /// `reply` is `None` on the first step and the previous call's answer after
+    /// that. `Step::Done` ends the flow; nothing calls `step` again.
+    fn step(&mut self, reply: Option<std::result::Result<String, String>>) -> Step;
+}
+
+/// Drive `flow` with the synchronous clients and answer what it decides.
+#[cfg(not(target_os = "emscripten"))]
+fn run_waiting(mut flow: impl Flow) -> String {
+    let mut reply = None;
+    loop {
+        match flow.step(reply) {
+            Step::Done(answer) => return answer,
+            Step::Call(call) => reply = Some(call.invoke_waiting()),
+        }
+    }
+}
+
+/// Drive `flow` with the `_async` clients, parking its answer on `job`.
+///
+/// Recursive, and bounded by the flow: each `Step::Call` re-enters exactly once,
+/// from the callback, and a flow that returns `Step::Done` stops.
+fn drive<F: Flow>(mut flow: F, reply: Option<std::result::Result<String, String>>, job: String) {
+    match flow.step(reply) {
+        Step::Done(answer) => JOBS.complete(&job, answer),
+        Step::Call(call) => call.invoke_async(move |r| drive(flow, Some(r), job)),
+    }
+}
+
+/// Start `flow` and answer its job id at once — the `start_*` spelling, and the
+/// one that works on every target.
+fn start_flow(flow: impl Flow) -> String {
+    let job_id = JOBS.start();
+    drive(flow, None, job_id.clone());
+    json!({ "ok": true, "jobId": job_id }).to_string()
+}
+
+/// Run `flow` to its answer — the WAITING spelling of a method.
+///
+/// On a native host this issues each call with the synchronous client, which is
+/// what every one of these methods has always done.
+#[cfg(not(target_os = "emscripten"))]
+fn answer(flow: impl Flow, _start: &str) -> String {
+    run_waiting(flow)
+}
+
+/// The same entry point on a `web` (wasm) image, where waiting is the one thing
+/// that cannot be done: one Worker, one event loop, no ASYNCIFY (ADR 0004), so
+/// the thread that would wait is the thread that must deliver. NOTHING is
+/// dispatched — a call whose reply can never be collected is worse than none —
+/// and the refusal names the method that does work, so a caller reading the
+/// error can act on it.
+#[cfg(target_os = "emscripten")]
+fn answer(flow: impl Flow, start: &str) -> String {
+    drop(flow);
+    err(format!(
+        "this build cannot wait for a reply (one Worker, one event loop): use {start}, then take_result"
+    ))
+}
+
+/// The flow of a method that makes exactly ONE outbound call: issue it, then
+/// answer whatever `finish` makes of the reply.
+struct OneCall<F> {
+    call: Option<Call>,
+    finish: Option<F>,
+}
+
+impl<F> Flow for OneCall<F>
+where
+    F: FnOnce(std::result::Result<String, String>) -> String + Send + 'static,
+{
+    fn step(&mut self, reply: Option<std::result::Result<String, String>>) -> Step {
+        match self.call.take() {
+            Some(call) => Step::Call(call),
+            None => {
+                let finish = self.finish.take().expect("a OneCall flow finishes once");
+                Step::Done(finish(reply.expect("the reply to the call just issued")))
+            }
+        }
+    }
+}
+
+fn one_call(
+    call: Call,
+    finish: impl FnOnce(std::result::Result<String, String>) -> String + Send + 'static,
+) -> impl Flow {
+    OneCall { call: Some(call), finish: Some(finish) }
+}
+
+/// A flow that never leaves the process: it already has its answer.
+///
+/// What a `plan_*` returns when it failed before the network — a malformed
+/// request, an address that will not parse — so that the two spellings report it
+/// identically and `start_*` still hands back a collectable job rather than a
+/// bare error a poller cannot tell from a transport failure.
+struct Answered(Option<String>);
+
+impl Flow for Answered {
+    fn step(&mut self, _reply: Option<std::result::Result<String, String>>) -> Step {
+        Step::Done(self.0.take().expect("an Answered flow answers once"))
+    }
+}
+
+/// The reply of a dependency method whose answer is passed straight through:
+/// its own JSON on success, this module's error envelope on a transport failure.
+fn passthrough(reply: std::result::Result<String, String>) -> String {
+    match reply {
+        Ok(s) => s,
+        Err(e) => err(e),
+    }
+}
+
 #[derive(Default)]
 struct WalletBackendModuleImpl {
     state: Option<State>,
 }
 
+/// chainId -> (token address -> (eth, usd)) prices.
+type PriceCache = Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>>>>;
+/// chainId -> (lowercased token address -> (symbol, decimals)).
+type MetaCache = Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, (String, u8)>>>>;
+/// Keystore approval handle -> the transaction parked on it.
+type JobMap = Arc<Mutex<std::collections::HashMap<String, PendingJob>>>;
+
 struct State {
     cfg: ConfigStore,
-    history: History,
+    /// `Arc` so a flow that records a broadcast tx from an async callback (a
+    /// `'static` closure that cannot borrow `&self`) writes the SAME store the
+    /// module reads. `History` is a path and its methods take `&self`, so there
+    /// is nothing here to lock.
+    history: Arc<History>,
     dir: std::path::PathBuf,
     /// chainId -> watched token addresses (persisted in watched.json).
     watched: std::collections::HashMap<u64, Vec<String>>,
@@ -95,11 +437,29 @@ struct State {
     balances: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     /// chainId -> (token address -> (eth, usd)) prices — populated by the
     /// `refresh_market` fan-out, read by `get_market`. Ephemeral (not persisted).
-    market_prices: Arc<Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>>>>,
+    market_prices: PriceCache,
+    /// Symbols and decimals per chain, populated by the same fan-out.
+    ///
+    /// `refresh_market` already had to ask `token_list_module` for decimals
+    /// before it could build a price request, and `get_market` then asked for
+    /// the SAME answer again to label the holdings. That second ask was a
+    /// synchronous call from a method that has nothing else to wait for, so it
+    /// is now the first leg of the fan-out and `get_market` reads what it left
+    /// here — which also makes `get_market` an entirely offline method, on every
+    /// target.
+    token_meta: MetaCache,
     /// Signing requests awaiting a human. Keyed by the keystore approval
     /// handle. Nothing here blocks a dispatch: a request returns immediately
-    /// and the UI drives it forward with `send_status`.
-    jobs: std::collections::HashMap<String, PendingJob>,
+    /// and the UI drives it forward with `send_status`. Behind an `Arc<Mutex<_>>`
+    /// for the reason `balances` is: the send flow's last step runs in a callback.
+    jobs: JobMap,
+    /// Whether eth_rpc has been told about the configured chains yet.
+    ///
+    /// ONLY A `web` IMAGE HAS TO ASK. On a native host `on_context_ready` sends
+    /// the configs itself and this is set there and never read again; on wasm it
+    /// CANNOT, and the flag is what makes the first dispatch do it instead. See
+    /// [`WalletBackendModuleImpl::st`].
+    configs_sent: bool,
 }
 
 /// A transaction parked on a human: broadcast it and record it once approved.
@@ -109,12 +469,18 @@ struct PendingJob {
     record: TxRecord,
 }
 
-/// Ask the keystore for a human approval over `legs`. Returns the handle to
-/// poll. This never waits for the human: keystore answers in microseconds and
-/// the decision arrives later, so no dispatch thread is ever parked on a person.
-fn request_signing(address: &str, purpose: &str, legs: Vec<Value>) -> std::result::Result<(String, String), String> {
-    let intent = json!({ "address": address, "purpose": purpose, "legs": legs }).to_string();
-    let resp = ok_value(modules().keystore_module.request_approval(&intent).map_err(|e| e.to_string())?)?;
+/// The approval intent asking a human to sign `legs` for `address`.
+///
+/// The ask itself is a step in [`SendFlow`] now rather than a helper that waits
+/// for it: `keystore_module` answers in microseconds, but "in microseconds" is
+/// still a reply, and a `web` image cannot wait for one.
+fn signing_intent(address: &str, purpose: &str, legs: Vec<Value>) -> String {
+    json!({ "address": address, "purpose": purpose, "legs": legs }).to_string()
+}
+
+/// The `{ handle, receipt }` pair `request_approval` answers. The receipt
+/// authorises collecting the result and is never re-derivable.
+fn approval_handle(resp: &Value) -> std::result::Result<(String, String), String> {
     let handle = resp["handle"].as_str().ok_or("keystore: no handle")?.to_string();
     let receipt = resp["receipt"].as_str().ok_or("keystore: no receipt")?.to_string();
     Ok((handle, receipt))
@@ -350,6 +716,35 @@ fn decode_call_balance_reply(reply: Option<String>) -> U256 {
         .unwrap_or(U256::ZERO)
 }
 
+/// What one chain's leg of the `refresh_market` fan-out answers: the chain, the
+/// token metadata that built its price request, and the prices themselves.
+type MarketLeg = (
+    u64,
+    std::collections::HashMap<String, (String, u8)>,
+    std::collections::HashMap<String, (Option<f64>, Option<f64>)>,
+);
+
+/// Decode a `token_list.get_tokens` reply (`{ tokens: [{address, symbol,
+/// decimals}] }`) into a lowercased `address -> (symbol, decimals)` map. Any
+/// failure yields an empty map, which prices the holding at 18 decimals and
+/// labels it by its short address — what the synchronous version did too.
+fn decode_token_meta(reply: Option<String>) -> std::collections::HashMap<String, (String, u8)> {
+    let mut map = std::collections::HashMap::new();
+    let Some(v) = reply.and_then(|s| serde_json::from_str::<Value>(&s).ok()) else {
+        return map;
+    };
+    if let Some(arr) = v.get("tokens").and_then(Value::as_array) {
+        for t in arr {
+            if let Some(addr) = t.get("address").and_then(Value::as_str) {
+                let sym = t.get("symbol").and_then(Value::as_str).unwrap_or("?").to_string();
+                let dec = t.get("decimals").and_then(Value::as_u64).unwrap_or(18) as u8;
+                map.insert(addr.to_lowercase(), (sym, dec));
+            }
+        }
+    }
+    map
+}
+
 /// Decode a uniswap `get_prices` reply (`{ prices: [{address, eth, usd}] }`) into
 /// a `token address -> (eth, usd)` map. Any failure yields an empty map.
 fn decode_uniswap_prices(reply: Option<String>) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
@@ -393,9 +788,364 @@ struct SendParams {
     gas_limit: Option<String>,
 }
 
+// ── the single-call plans ────────────────────────────────────────────────────
+//
+// Free functions rather than methods: none of them reads module state, and the
+// two spellings of each method then share one definition instead of agreeing by
+// inspection.
+
+/// `test_endpoint`: ask eth_rpc whether the endpoint really is this chain.
+fn plan_test_endpoint(chain_id: i64) -> impl Flow {
+    one_call(Call::EthVerifyChainId(chain_id), passthrough)
+}
+
+/// `list_accounts`: the keystore's answer, passed straight through.
+fn plan_list_accounts() -> impl Flow {
+    one_call(Call::KeystoreListAccounts, passthrough)
+}
+
+/// `get_tokens`: token_list's catalogue for a chain, passed straight through.
+fn plan_get_tokens(chain_id: i64) -> impl Flow {
+    one_call(Call::TokenListGetTokens(chain_id), passthrough)
+}
+
+/// `add_custom_token`: token_list's `bool`, in an envelope that also has room
+/// for a transport failure. The waiting twin flattens both back to a `bool`.
+fn plan_add_custom_token(token_json: String) -> impl Flow {
+    one_call(Call::TokenListAddCustomToken(token_json), |reply| match reply {
+        Ok(b) => json!({ "ok": true, "added": b == "true" }).to_string(),
+        Err(e) => err(e),
+    })
+}
+
+/// `estimate_fee`: one fee_module quote over the send the caller described.
+///
+/// Delegated to fee_module. The gas limit was hardcoded 21_000 / 90_000 here,
+/// which is right for a bare transfer and wrong for any ERC-20 that does more
+/// than move a balance -- so hand fee_module the actual call and let it run
+/// estimate_gas. Without a `tx` it has nothing to measure and correctly returns
+/// 0, which is how this first shipped.
+fn plan_estimate_fee(send_json: &str) -> Box<dyn Flow> {
+    let p: SendParams = match serde_json::from_str(send_json) {
+        Ok(p) => p,
+        Err(e) => return Box::new(Answered(Some(err(e)))),
+    };
+    let tx = match parse_addr(&p.to) {
+        Ok(to_addr) => {
+            if p.token_address.is_empty() {
+                json!({ "from": p.from, "to": p.to,
+                        "value": format!("0x{:x}", parse_u256_str(&p.amount)) })
+            } else {
+                let data = txbuild::erc20_transfer_calldata(to_addr, parse_u256_str(&p.amount));
+                json!({ "from": p.from, "to": p.token_address,
+                        "data": format!("0x{}", hex::encode(data)) })
+            }
+        }
+        // An unparseable recipient is the caller's problem, not a reason to
+        // refuse a fee quote: fall back to no tx and report gasLimit 0.
+        Err(_) => Value::Null,
+    };
+    let mut fee_req = json!({
+        "tier": p.tier.clone().unwrap_or_else(|| "normal".into()),
+        "maxFeePerGas": p.max_fee_per_gas.clone(),
+        "maxPriorityFeePerGas": p.max_priority_fee_per_gas.clone(),
+        "gasLimit": p.gas_limit.clone(),
+    });
+    if !tx.is_null() {
+        fee_req["tx"] = tx;
+    }
+    Box::new(one_call(Call::FeeEstimate(p.chain_id as i64, fee_req.to_string()), passthrough))
+}
+
+/// A boxed flow is a flow, so a `plan_*` that may answer before the network can
+/// hand back either shape.
+impl Flow for Box<dyn Flow> {
+    fn step(&mut self, reply: Option<std::result::Result<String, String>>) -> Step {
+        (**self).step(reply)
+    }
+}
+
+// ── send: nonce → fee → gas → a human ────────────────────────────────────────
+
+/// Which of [`SendFlow`]'s four calls is in flight.
+enum SendStage {
+    Nonce,
+    Fee,
+    Gas,
+    Approve,
+}
+
+/// `send_native` / `send_erc20`, as the chain of calls it has always been.
+///
+/// Strictly sequential, and not by choice: the fee request is issued for the
+/// chain the nonce was read on, the gas estimate is over a tx built from both,
+/// and the approval asks a human to sign the result. Nothing here can be fanned
+/// out, and nothing here depends on reply ORDER either — each call is issued
+/// only once the previous reply is in hand.
+///
+/// Everything that does NOT depend on a reply — the recipient address, the
+/// estimate's tx shape, the ERC-20 calldata, the default gas limit — is
+/// resolved by `plan_send` before the first call goes out. A recipient that will
+/// not parse is therefore reported without spending a nonce read and a fee
+/// quote on it first; the error a caller sees is the same one it always was.
+struct SendFlow {
+    stage: SendStage,
+    chain_id: u64,
+    from: String,
+    /// The recipient as the caller spelled it, for the history record.
+    to: String,
+    to_addr: Address,
+    /// `Some((token, amount))` for an ERC-20 transfer, `None` for a native send.
+    erc20: Option<(Address, U256)>,
+    /// The native value, or the token amount, as `txbuild` needs it.
+    amount: U256,
+    fee_req: String,
+    est_tx: String,
+    default_gas: u64,
+    jobs: JobMap,
+
+    // Filled in as the replies land.
+    nonce: u64,
+    fee: Option<Fee>,
+    gas_limit: u64,
+}
+
+impl SendFlow {
+    /// The unsigned transaction the human is asked to approve. Only callable
+    /// once the nonce, the fee and the gas limit are all in.
+    fn unsigned(&self) -> Value {
+        let fee = self.fee.as_ref().expect("the fee reply landed before the approval");
+        match &self.erc20 {
+            Some((token, amount)) => {
+                txbuild::unsigned_erc20_tx(*token, self.to_addr, *amount, self.nonce, self.gas_limit, fee)
+            }
+            None => txbuild::unsigned_native_tx(self.to_addr, self.amount, self.nonce, self.gas_limit, fee),
+        }
+    }
+
+    /// Park the approved-but-unsigned transaction and answer the request id.
+    fn park(&mut self, resp: &Value) -> std::result::Result<Value, String> {
+        let (handle, receipt) = approval_handle(resp)?;
+        let (kind, token, value) = match &self.erc20 {
+            Some((token, amount)) => ("erc20", Some(format!("{token}")), amount.to_string()),
+            None => ("native", None, self.amount.to_string()),
+        };
+        let record = TxRecord {
+            // Filled in when the signature comes back and is broadcast.
+            hash: String::new(),
+            chain_id: self.chain_id,
+            from: self.from.clone(),
+            to: self.to.clone(),
+            value,
+            kind: kind.into(),
+            token,
+            status: "pending".into(),
+            timestamp: now_secs(),
+        };
+        // History is written when the tx is actually broadcast — recording it
+        // now would show the user a transaction they have not yet approved.
+        self.jobs.lock().unwrap().insert(
+            handle.clone(),
+            PendingJob { chain_id: self.chain_id, receipt, record },
+        );
+        Ok(json!({ "ok": true, "pending": true, "requestId": handle }))
+    }
+}
+
+impl Flow for SendFlow {
+    fn step(&mut self, reply: Option<std::result::Result<String, String>>) -> Step {
+        let Some(reply) = reply else {
+            return Step::Call(Call::EthTransactionCount(self.chain_id as i64, self.from.clone()));
+        };
+        match self.stage {
+            SendStage::Nonce => {
+                let v = match reply.and_then(ok_value) {
+                    Ok(v) => v,
+                    Err(e) => return Step::Done(err(e)),
+                };
+                self.nonce = parse_hex_u64(v["result"].as_str().unwrap_or("0x0"));
+                self.stage = SendStage::Fee;
+                Step::Call(Call::FeeEstimate(self.chain_id as i64, self.fee_req.clone()))
+            }
+            SendStage::Fee => {
+                let v = match reply.and_then(ok_value) {
+                    Ok(v) => v,
+                    Err(e) => return Step::Done(err(e)),
+                };
+                self.fee = Some(Fee::Eip1559 {
+                    max_fee_per_gas: parse_u256_str(v["maxFeePerGas"].as_str().unwrap_or("0")),
+                    max_priority_fee_per_gas: parse_u256_str(v["maxPriorityFeePerGas"].as_str().unwrap_or("0")),
+                });
+                self.stage = SendStage::Gas;
+                Step::Call(Call::EthEstimateGas(self.chain_id as i64, self.est_tx.clone()))
+            }
+            SendStage::Gas => {
+                // A gas estimate that fails is not a reason to refuse the send:
+                // the hardcoded default is right for a bare transfer and the
+                // human sees the limit either way.
+                self.gas_limit = reply
+                    .ok()
+                    .and_then(|s| ok_value(s).ok())
+                    .and_then(|v| v["result"].as_str().map(parse_hex_u64))
+                    .unwrap_or(self.default_gas);
+                self.stage = SendStage::Approve;
+                let unsigned = self.unsigned();
+                Step::Call(Call::KeystoreRequestApproval(signing_intent(
+                    &self.from,
+                    "send",
+                    vec![tx_leg(self.chain_id, &unsigned)],
+                )))
+            }
+            SendStage::Approve => Step::Done(
+                match reply.and_then(ok_value).and_then(|v| self.park(&v)) {
+                    Ok(v) => v.to_string(),
+                    Err(e) => err(e),
+                },
+            ),
+        }
+    }
+}
+
+// ── send_status: approval → signatures → broadcast → acknowledge ─────────────
+
+/// Which of [`StatusFlow`]'s calls is in flight.
+enum StatusStage {
+    Status,
+    Fetch,
+    Broadcast,
+    Ack,
+}
+
+/// `send_status`: poll the human's decision, and on approval put the signature
+/// into the transaction, broadcast it and record it.
+///
+/// Safe to call repeatedly, which is the whole contract: it short-circuits to
+/// `awaiting_approval` while nobody has decided, and `fetch_result` is
+/// idempotent until `ack_result` acknowledges it.
+struct StatusFlow {
+    stage: StatusStage,
+    request_id: String,
+    receipt: String,
+    jobs: JobMap,
+    history: Arc<History>,
+    /// The record taken off the parked job, carried from the step that removed
+    /// it to the step that learns its hash.
+    pending: Option<TxRecord>,
+    /// The broadcast hash, kept so the final answer can carry it after the
+    /// best-effort acknowledgement has gone out.
+    hash: String,
+}
+
+impl Flow for StatusFlow {
+    fn step(&mut self, reply: Option<std::result::Result<String, String>>) -> Step {
+        let Some(reply) = reply else {
+            return Step::Call(Call::KeystoreApprovalStatus(
+                self.request_id.clone(),
+                self.receipt.clone(),
+            ));
+        };
+        match self.stage {
+            StatusStage::Status => {
+                let st = match reply.and_then(ok_value) {
+                    Ok(v) => v,
+                    Err(e) => return Step::Done(err(e)),
+                };
+                match st["state"].as_str().unwrap_or("") {
+                    "offered" | "rendered" => {
+                        return Step::Done(json!({ "ok": true, "state": "awaiting_approval" }).to_string())
+                    }
+                    "settled" => {}
+                    other => return Step::Done(err(format!("unexpected approval state {other:?}"))),
+                }
+                if st["reason"].as_str() != Some("approved") {
+                    let reason = st["reason"].as_str().unwrap_or("settled").to_string();
+                    self.jobs.lock().unwrap().remove(&self.request_id);
+                    return Step::Done(json!({ "ok": true, "state": "declined", "reason": reason }).to_string());
+                }
+                self.stage = StatusStage::Fetch;
+                Step::Call(Call::KeystoreFetchResult(self.request_id.clone(), self.receipt.clone()))
+            }
+            StatusStage::Fetch => {
+                let fetched = match reply.and_then(ok_value) {
+                    Ok(v) => v,
+                    Err(e) => return Step::Done(err(e)),
+                };
+                // `signed`, which is what `fetch_result` answers:
+                // `{ ok, signed: [...] }`. Reading `results` collected nothing,
+                // every time, and no doctest caught it because they all stop at
+                // the approval.
+                let sigs: Vec<String> = fetched["signed"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                let Some(raw) = sigs.into_iter().next() else {
+                    return Step::Done(err("keystore: approval produced no signatures"));
+                };
+                let Some(job) = self.jobs.lock().unwrap().remove(&self.request_id) else {
+                    return Step::Done(err("unknown request"));
+                };
+                self.stage = StatusStage::Broadcast;
+                self.pending = Some(job.record);
+                Step::Call(Call::EthSendRawTransaction(job.chain_id as i64, raw))
+            }
+            StatusStage::Broadcast => {
+                let bcast = match reply.and_then(ok_value) {
+                    Ok(v) => v,
+                    Err(e) => return Step::Done(err(e)),
+                };
+                let Some(hash) = bcast["hash"].as_str() else {
+                    return Step::Done(err("broadcast: no hash"));
+                };
+                self.hash = hash.to_string();
+                let mut record = self.pending.take().expect("the record taken off the parked job");
+                record.hash = self.hash.clone();
+                let from = record.from.clone();
+                self.history.add(&from, record);
+                emit_tx_status_changed(&self.hash);
+                self.stage = StatusStage::Ack;
+                // Tell the keystore we have them so it can wipe its copy. Best
+                // effort: the transaction is already on the chain.
+                Step::Call(Call::KeystoreAckResult(self.request_id.clone(), self.receipt.clone()))
+            }
+            StatusStage::Ack => Step::Done(
+                json!({ "ok": true, "state": "done", "hash": self.hash }).to_string(),
+            ),
+        }
+    }
+}
+
 impl WalletBackendModuleImpl {
     fn st(&mut self) -> std::result::Result<&mut State, String> {
-        self.state.as_mut().ok_or_else(|| "backend not initialized (context not ready)".to_string())
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| "backend not initialized (context not ready)".to_string())?;
+
+        // ── THE CHAIN CONFIGS, SENT ON THE FIRST DISPATCH RATHER THAN AT LOAD ──
+        //
+        // `on_context_ready` is where this belongs and where it happens on every
+        // other target. It cannot happen there in a `web` image: the hook fires
+        // AT MODULE LOAD, "as soon as the host has delivered both the context
+        // and the event plumbing" (the generated `install`), and the wasm host
+        // installs the OUTBOUND DOOR after that — `logos_wasm_host.cpp`'s main()
+        // does `logos_module_set_context` / `set_emit_callback` first and
+        // `logos::wasm::setOutboundConnection` several lines later. A call made
+        // in between finds no connection and is refused inline by
+        // `lp_invoke_async`, with nothing on the wire: eth_rpc would simply never
+        // learn the endpoints, and every balance read would go to a chain it has
+        // no RPC URL for.
+        //
+        // So on this target the send is deferred to the first dispatch, which is
+        // the earliest moment the door is certainly open. The ordering the native
+        // path guarantees is preserved — nothing this module does reaches eth_rpc
+        // without coming through here first.
+        #[cfg(target_os = "emscripten")]
+        if !st.configs_sent {
+            st.configs_sent = true;
+            Self::push_chain_configs(st);
+        }
+
+        Ok(st)
     }
 
     fn save_watched(st: &State) {
@@ -413,12 +1163,47 @@ impl WalletBackendModuleImpl {
     }
 
     /// Push every configured chain's RPC + proxy config into eth_rpc.
+    ///
+    /// THE ONE PLACE THIS MODULE STILL SPELLS A CALL TWICE, and deliberately.
+    /// Nothing reads the reply — `set_chain_config` answers a `bool` nobody
+    /// looks at — so the async form loses no information. What it would lose is
+    /// ORDER: a caller that does `set_chains(...)` and then `refresh_balances`
+    /// expects eth_rpc to already know the endpoint, and on a native host the
+    /// synchronous client and the async completion path are different
+    /// mechanisms, so a queued config could still be in flight when the first
+    /// balance read overtakes it. The native spelling therefore stays
+    /// synchronous, which is what it always was.
+    #[cfg(not(target_os = "emscripten"))]
     fn push_chain_configs(st: &State) {
         for c in &st.cfg.config().chains {
             if let Some(cfg) = st.cfg.eth_rpc_config(c.chain_id) {
                 let _ = modules().eth_rpc_module.set_chain_config(c.chain_id as i64, &cfg.to_string());
             }
         }
+    }
+
+    /// The same push on a `web` (wasm) image, where there is no synchronous
+    /// client to use.
+    ///
+    /// ONE AT A TIME, each from the last one's callback, rather than all at
+    /// once. Two reasons, and the second is the one that costs if you get it
+    /// wrong: the pushes stay strictly ordered, and the image runs the
+    /// `capability_module.requestModule` handshake ONCE. The outbound door has
+    /// no in-flight de-duplication — it checks the token store, and six calls
+    /// fired before any grant has landed all find it empty and all ask
+    /// (`wasm_lp_abi.cpp`, `lp_invoke_async`). Six handshakes to say one thing
+    /// is a startup this module can simply not have.
+    #[cfg(target_os = "emscripten")]
+    fn push_chain_configs(st: &State) {
+        let mut queue: Vec<(i64, String)> = st
+            .cfg
+            .config()
+            .chains
+            .iter()
+            .filter_map(|c| st.cfg.eth_rpc_config(c.chain_id).map(|cfg| (c.chain_id as i64, cfg.to_string())))
+            .collect();
+        queue.reverse(); // `pop` takes the front
+        push_next_chain_config(queue);
     }
 
     /// Combine cached balances (tokens with balance > 0) with Uniswap prices for
@@ -446,7 +1231,7 @@ impl WalletBackendModuleImpl {
             }
 
             // symbol/decimals lookup (lowercased address -> (symbol, decimals)).
-            let meta = self.token_meta(chain_id as i64);
+            let meta = self.cached_token_meta(chain_id);
 
             // Held tokens (balance > 0) → the set we price.
             let empty_toks = Vec::new();
@@ -462,8 +1247,7 @@ impl WalletBackendModuleImpl {
                 held.push((addr.to_string(), dec));
             }
 
-            // Ask Uniswap for prices (held tokens; module adds stablecoins itself).
-            let prices = self.uniswap_prices(chain_id as i64, &held);
+            let prices = self.cached_prices(chain_id);
 
             // Native ETH item.
             let native_bal = chain.get("native").and_then(Value::as_str).unwrap_or("0");
@@ -502,46 +1286,37 @@ impl WalletBackendModuleImpl {
         Ok(json!({ "ok": true, "address": address, "chains": chains_out }))
     }
 
-    /// `token_list.get_tokens(chainId)` → lowercased address -> (symbol, decimals).
-    fn token_meta(&mut self, chain_id: i64) -> std::collections::HashMap<String, (String, u8)> {
-        let mut map = std::collections::HashMap::new();
-        if let Ok(s) = modules().token_list_module.get_tokens(chain_id) {
-            if let Ok(v) = serde_json::from_str::<Value>(&s) {
-                if let Some(arr) = v.get("tokens").and_then(Value::as_array) {
-                    for t in arr {
-                        if let Some(addr) = t.get("address").and_then(Value::as_str) {
-                            let sym = t.get("symbol").and_then(Value::as_str).unwrap_or("?").to_string();
-                            let dec = t.get("decimals").and_then(Value::as_u64).unwrap_or(18) as u8;
-                            map.insert(addr.to_lowercase(), (sym, dec));
-                        }
-                    }
-                }
-            }
-        }
-        map
-    }
-
-    /// Ask `uniswap_module` for token→(eth, usd) prices, keyed by the address
-    /// string we passed (plus an `"ETH"` entry for native). Empty on failure.
-    /// Read the cached per-chain prices that `refresh_market` populated. `held` is
-    /// unused now — the cache already holds every priced token for the chain.
-    fn uniswap_prices(&mut self, chain_id: i64, _held: &[(String, u8)]) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+    /// The symbols and decimals `refresh_market` cached for a chain.
+    ///
+    /// Was a synchronous `token_list.get_tokens` per chain per call. It is the
+    /// SAME answer the fan-out already had to fetch to build its price request,
+    /// so it is fetched once there and read here — which is what makes
+    /// `get_market` an offline method on every target rather than a method that
+    /// waits for one call per chain.
+    fn cached_token_meta(&mut self, chain_id: u64) -> std::collections::HashMap<String, (String, u8)> {
         self.st()
             .ok()
-            .and_then(|st| st.market_prices.lock().unwrap().get(&(chain_id as u64)).cloned())
+            .and_then(|st| st.token_meta.lock().unwrap().get(&chain_id).cloned())
             .unwrap_or_default()
     }
 
-    /// Build → sign → broadcast → record. `erc20` carries (token, amount) when set.
-    fn do_send(&mut self, p: &SendParams, erc20: Option<(Address, U256)>) -> std::result::Result<Value, String> {
-        let from = p.from.clone();
+    /// The token→(eth, usd) prices `refresh_market` cached for a chain, keyed by
+    /// the address string it priced (plus an `"ETH"` entry for native). Empty
+    /// until the fan-out has run, which prices every holding at `null`.
+    fn cached_prices(&mut self, chain_id: u64) -> std::collections::HashMap<String, (Option<f64>, Option<f64>)> {
+        self.st()
+            .ok()
+            .and_then(|st| st.market_prices.lock().unwrap().get(&chain_id).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Plan a send: everything that does not need the network, resolved before
+    /// the first call goes out. `erc20` carries (token, amount) when set.
+    fn plan_send(&mut self, p: &SendParams, erc20: Option<(Address, U256)>) -> std::result::Result<SendFlow, String> {
+        let to_addr = parse_addr(&p.to)?;
+        let jobs = Arc::clone(&self.st()?.jobs);
         let chain_id = p.chain_id;
 
-        // nonce + a simple EIP-1559 fee derived from gasPrice
-        let nonce = parse_hex_u64(
-            ok_value(modules().eth_rpc_module.get_transaction_count(chain_id as i64, &from).map_err(|e| e.to_string())?)?
-                ["result"].as_str().unwrap_or("0x0"),
-        );
         // Fees come from fee_module, which derives the tip from eth_feeHistory.
         // This used to be `max_fee = gas_price * 2, max_priority = gas_price` --
         // and since eth_gasPrice is roughly baseFee + tip, that tipped
@@ -553,17 +1328,10 @@ impl WalletBackendModuleImpl {
             "tier": p.tier.clone().unwrap_or_else(|| "normal".into()),
             "maxFeePerGas": p.max_fee_per_gas.clone(),
             "maxPriorityFeePerGas": p.max_priority_fee_per_gas.clone(),
-        });
-        let fee_reply = ok_value(
-            modules().fee_module.estimate(chain_id as i64, &fee_req.to_string()).map_err(|e| e.to_string())?,
-        )?;
-        let fee = Fee::Eip1559 {
-            max_fee_per_gas: parse_u256_str(fee_reply["maxFeePerGas"].as_str().unwrap_or("0")),
-            max_priority_fee_per_gas: parse_u256_str(fee_reply["maxPriorityFeePerGas"].as_str().unwrap_or("0")),
-        };
+        })
+        .to_string();
 
-        // estimate gas against a from/to/value/data shape
-        let to_addr = parse_addr(&p.to)?;
+        // The from/to/value/data shape the gas estimate is run against.
         let (est_to, est_value, est_data, default_gas): (String, String, String, u64) = match &erc20 {
             Some((token, amount)) => {
                 let data = txbuild::erc20_transfer_calldata(to_addr, *amount);
@@ -571,112 +1339,157 @@ impl WalletBackendModuleImpl {
             }
             None => (p.to.clone(), format!("0x{:x}", parse_u256_str(&p.amount)), "0x".into(), 21_000),
         };
-        let est_tx = json!({ "from": from, "to": est_to, "value": est_value, "data": est_data }).to_string();
-        let gas_limit = match modules().eth_rpc_module.estimate_gas(chain_id as i64, &est_tx) {
-            Ok(s) => ok_value(s).ok().and_then(|v| v["result"].as_str().map(parse_hex_u64)).unwrap_or(default_gas),
-            Err(_) => default_gas,
-        };
+        let est_tx =
+            json!({ "from": p.from, "to": est_to, "value": est_value, "data": est_data }).to_string();
 
-        // build the unsigned tx
-        let unsigned = match &erc20 {
-            Some((token, amount)) => txbuild::unsigned_erc20_tx(*token, to_addr, *amount, nonce, gas_limit, &fee),
-            None => txbuild::unsigned_native_tx(to_addr, parse_u256_str(&p.amount), nonce, gas_limit, &fee),
-        };
-
-        // Ask a human. Nothing is signed or broadcast here; the hash does not
-        // exist yet, so the caller gets a request id and polls `send_status`.
-        let (handle, receipt) = request_signing(&from, "send", vec![tx_leg(chain_id, &unsigned)])?;
-
-        let (kind, token, value) = match &erc20 {
-            Some((token, amount)) => ("erc20", Some(format!("{token}")), amount.to_string()),
-            None => ("native", None, parse_u256_str(&p.amount).to_string()),
-        };
-        let record = TxRecord {
-            // Filled in when the signature comes back and is broadcast.
-            hash: String::new(),
+        Ok(SendFlow {
+            stage: SendStage::Nonce,
             chain_id,
-            from: from.clone(),
+            from: p.from.clone(),
             to: p.to.clone(),
-            value,
-            kind: kind.into(),
-            token,
-            status: "pending".into(),
-            timestamp: now_secs(),
-        };
-        // Park the job. History is written when the tx is actually broadcast —
-        // recording it now would show the user a transaction they have not yet
-        // approved.
-        self.st()?
-            .jobs
-            .insert(handle.clone(), PendingJob { chain_id: chain_id as u64, receipt, record });
-        Ok(json!({ "ok": true, "pending": true, "requestId": handle }))
+            to_addr,
+            erc20,
+            amount: erc20.map(|(_, a)| a).unwrap_or_else(|| parse_u256_str(&p.amount)),
+            fee_req,
+            est_tx,
+            default_gas,
+            jobs,
+            nonce: 0,
+            fee: None,
+            gas_limit: default_gas,
+        })
     }
 
-    /// Drive a parked job forward: `{ ok, state, hash?, reason? }`. Safe to
-    /// call repeatedly.
-    fn job_status(&mut self, request_id: &str) -> std::result::Result<Value, String> {
-        let receipt = match self.st()?.jobs.get(request_id) {
+    /// Parse a native send request and plan it. Shared by the two spellings of
+    /// `send_native`, which differ only in how they drive the flow.
+    fn plan_send_native(&mut self, send_json: &str) -> std::result::Result<SendFlow, String> {
+        let p: SendParams = serde_json::from_str(send_json).map_err(|e| e.to_string())?;
+        self.plan_send(&p, None)
+    }
+
+    /// Parse an ERC-20 send request and plan it. Shared by the two spellings of
+    /// `send_erc20`, which differ only in how they drive the flow.
+    fn plan_send_erc20(&mut self, send_json: &str) -> std::result::Result<SendFlow, String> {
+        let p: SendParams = serde_json::from_str(send_json).map_err(|e| e.to_string())?;
+        let token = parse_addr(&p.token_address)?;
+        let amount = parse_u256_str(&p.amount);
+        self.plan_send(&p, Some((token, amount)))
+    }
+
+    /// Plan a `send_status` poll. The receipt is read here, under `&mut self`,
+    /// so the flow itself never has to reach back into module state for it.
+    fn plan_send_status(&mut self, request_id: &str) -> std::result::Result<StatusFlow, String> {
+        let st = self.st()?;
+        let jobs = Arc::clone(&st.jobs);
+        let history = Arc::clone(&st.history);
+        let receipt = match jobs.lock().unwrap().get(request_id) {
             Some(job) => job.receipt.clone(),
             None => return Err("unknown request".into()),
         };
-
-        let st = ok_value(
-            modules().keystore_module.approval_status(request_id, &receipt).map_err(|e| e.to_string())?,
-        )?;
-        match st["state"].as_str().unwrap_or("") {
-            "offered" | "rendered" => {
-                return Ok(json!({ "ok": true, "state": "awaiting_approval" }))
-            }
-            "settled" => {}
-            other => return Err(format!("unexpected approval state {other:?}")),
-        }
-        if st["reason"].as_str() != Some("approved") {
-            let reason = st["reason"].as_str().unwrap_or("settled").to_string();
-            self.st()?.jobs.remove(request_id);
-            return Ok(json!({ "ok": true, "state": "declined", "reason": reason }));
-        }
-
-        // Approved: collect the signatures, then act on them.
-        let fetched = ok_value(
-            modules().keystore_module.fetch_result(request_id, &receipt).map_err(|e| e.to_string())?,
-        )?;
-        // `signed`, which is what `fetch_result` answers: `{ ok, signed: [...] }`.
-        // Reading `results` collected nothing, every time, and no doctest caught it
-        // because they all stop at the approval.
-        let sigs: Vec<String> = fetched["signed"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        if sigs.is_empty() {
-            return Err("keystore: approval produced no signatures".into());
-        }
-
-        let PendingJob { chain_id, mut record, .. } =
-            self.st()?.jobs.remove(request_id).ok_or("unknown request")?;
-        let bcast = ok_value(
-            modules()
-                .eth_rpc_module
-                .send_raw_transaction(chain_id as i64, &sigs[0])
-                .map_err(|e| e.to_string())?,
-        )?;
-        let hash = bcast["hash"].as_str().ok_or("broadcast: no hash")?.to_string();
-        record.hash = hash.clone();
-        let from = record.from.clone();
-        if let Ok(state) = self.st() {
-            state.history.add(&from, record);
-        }
-        emit_tx_status_changed(&hash);
-        // Tell the keystore we have them so it can wipe its copy.
-        let _ = modules().keystore_module.ack_result(request_id, &receipt);
-        Ok(json!({ "ok": true, "state": "done", "hash": hash }))
+        Ok(StatusFlow {
+            stage: StatusStage::Status,
+            request_id: request_id.to_string(),
+            receipt,
+            jobs,
+            history,
+            pending: None,
+            hash: String::new(),
+        })
     }
+
+    /// Plan the label-on-import: one keystore call, then a local labels.json
+    /// write that the reply is passed through unchanged around.
+    fn plan_import_mnemonic(&mut self, phrase_json: String, label: String) -> impl Flow {
+        let dir = self.st().ok().map(|st| st.dir.clone());
+        one_call(Call::KeystoreImportMnemonic(phrase_json), move |reply| match reply {
+            Ok(keystore_reply) => label_imported_account(dir, keystore_reply, label),
+            Err(e) => err(e),
+        })
+    }
+
+    /// Plan a receipt poll: one eth_rpc call, then a local history update.
+    fn plan_refresh_tx_status(&mut self, hash_hex: String, chain_id: i64) -> impl Flow {
+        let state = self.st().ok().map(|st| (Arc::clone(&st.history), st.dir.clone()));
+        one_call(Call::EthTransactionReceipt(chain_id, hash_hex.clone()), move |reply| {
+            let receipt = match reply {
+                Ok(s) => s,
+                Err(e) => return err(e),
+            };
+            let v = match ok_value(receipt) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+            // null result => still pending
+            let status = match v.get("result") {
+                Some(Value::Null) | None => "pending",
+                Some(r) => {
+                    if r.get("status").and_then(Value::as_str) == Some("0x1") {
+                        "confirmed"
+                    } else {
+                        "failed"
+                    }
+                }
+            };
+            // update the owning account's record (search all known history files is
+            // overkill; the UI passes the address-scoped call separately if needed).
+            if status != "pending" {
+                if let Some((history, dir)) = state {
+                    // best-effort: update across the sender's file when present
+                    for entry in std::fs::read_dir(dir.join("history")).into_iter().flatten().flatten() {
+                        if let Some(name) = entry.file_name().to_str().and_then(|n| n.strip_suffix(".json")) {
+                            if history.update_status(name, &hash_hex, status) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            emit_tx_status_changed(&hash_hex);
+            json!({ "ok": true, "status": status }).to_string()
+        })
+    }
+}
+
+/// Push one chain's config, then the next, from its callback.
+#[cfg(target_os = "emscripten")]
+fn push_next_chain_config(mut queue: Vec<(i64, String)>) {
+    let Some((chain_id, cfg)) = queue.pop() else { return };
+    modules()
+        .eth_rpc_module
+        .set_chain_config_async(chain_id, &cfg, move |_| push_next_chain_config(queue));
+}
+
+/// Persist an address->label from a keystore reply, and pass the reply on
+/// unchanged. Import is the only caller left: creating an account became
+/// Tier D and left this module's contract with it.
+///
+/// A free function taking the directory rather than a method: it runs in the
+/// callback of the import call, by which time the method that asked has
+/// returned and `&self` is long gone. `None` = the context was never ready, in
+/// which case the label is dropped and the reply still passed through, exactly
+/// as before.
+fn label_imported_account(dir: Option<std::path::PathBuf>, keystore_reply: String, label: String) -> String {
+    let v = match ok_value(keystore_reply.clone()) {
+        Ok(v) => v,
+        Err(e) => return err(e),
+    };
+    if let Some(addr) = v.get("address").and_then(Value::as_str) {
+        if let Some(dir) = dir {
+            let p = dir.join("labels.json");
+            let mut labels: std::collections::HashMap<String, String> =
+                std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+            labels.insert(addr.to_lowercase(), label);
+            let _ = std::fs::write(p, serde_json::to_string_pretty(&labels).unwrap_or_default());
+        }
+    }
+    keystore_reply
 }
 
 impl WalletBackendModule for WalletBackendModuleImpl {
     fn on_context_ready(&mut self, ctx: &RustModuleContext) {
         let dir = std::path::PathBuf::from(&ctx.instance_persistence_path);
         let cfg = ConfigStore::with_path(dir.join("config.json"));
-        let history = History::new(dir.clone());
+        let history = Arc::new(History::new(dir.clone()));
         let watched = std::fs::read_to_string(dir.join("watched.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
@@ -688,7 +1501,20 @@ impl WalletBackendModule for WalletBackendModuleImpl {
                 .unwrap_or_default(),
         ));
         let market_prices = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let st = State { cfg, history, dir, watched, balances, market_prices, jobs: Default::default() };
+        let token_meta = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let st = State {
+            cfg,
+            history,
+            dir,
+            watched,
+            balances,
+            market_prices,
+            token_meta,
+            jobs: Default::default(),
+            // On wasm the door is not open yet; `st()` sends them instead.
+            configs_sent: cfg!(not(target_os = "emscripten")),
+        };
+        #[cfg(not(target_os = "emscripten"))]
         Self::push_chain_configs(&st);
         self.state = Some(st);
     }
@@ -738,25 +1564,15 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn test_endpoint(&mut self, chain_id: i64) -> String {
-        match modules().eth_rpc_module.verify_chain_id(chain_id) {
-            Ok(s) => s,
-            Err(e) => err(e),
-        }
+        answer(plan_test_endpoint(chain_id), "start_test_endpoint")
     }
 
     fn import_mnemonic(&mut self, phrase_json: String, label: String) -> String {
-        let resp = match modules().keystore_module.import_mnemonic(&phrase_json) {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
-        self.label_imported_account(resp, label)
+        answer(self.plan_import_mnemonic(phrase_json, label), "start_import_mnemonic")
     }
 
     fn list_accounts(&mut self) -> String {
-        match modules().keystore_module.list_accounts() {
-            Ok(s) => s,
-            Err(e) => err(e),
-        }
+        answer(plan_list_accounts(), "start_list_accounts")
     }
 
     fn set_watched_tokens(&mut self, chain_id: i64, addresses_json: String) -> bool {
@@ -782,14 +1598,26 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn get_tokens(&mut self, chain_id: i64) -> String {
-        match modules().token_list_module.get_tokens(chain_id) {
-            Ok(s) => s,
-            Err(e) => err(e),
-        }
+        answer(plan_get_tokens(chain_id), "start_get_tokens")
     }
 
+    /// `false` on a `web` image. A `bool` has no room for "ask again later", so
+    /// the refusal that every other waiting method spells out in words is just
+    /// the failure value here — which is why `start_add_custom_token` exists and
+    /// why the trait doc says so.
     fn add_custom_token(&mut self, token_json: String) -> bool {
-        modules().token_list_module.add_custom_token(&token_json).unwrap_or(false)
+        #[cfg(target_os = "emscripten")]
+        {
+            let _ = token_json;
+            false
+        }
+        #[cfg(not(target_os = "emscripten"))]
+        {
+            serde_json::from_str::<Value>(&run_waiting(plan_add_custom_token(token_json)))
+                .ok()
+                .and_then(|v| v["added"].as_bool())
+                .unwrap_or(false)
+        }
     }
 
     fn refresh_balances(&mut self, address: String) -> bool {
@@ -843,19 +1671,23 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn refresh_market(&mut self, address: String) -> bool {
-        let cached = {
+        let (cached, prices_cache, meta_cache) = {
             let st = match self.st() {
                 Ok(s) => s,
                 Err(_) => return false,
             };
-            st.balances.lock().unwrap().get(&address).cloned()
+            (
+                st.balances.lock().unwrap().get(&address).cloned(),
+                Arc::clone(&st.market_prices),
+                Arc::clone(&st.token_meta),
+            )
         };
         let Some(cached) = cached else {
             // No balances yet — nothing to price; signal done so the UI doesn't wait.
             emit_market_updated(&address);
             return true;
         };
-        // Pass 1: pull (chainId, tokens) from the cached aggregate (no &self borrow).
+        // Pull (chainId, tokens) from the cached aggregate (no &self borrow).
         let chain_data: Vec<(u64, Vec<Value>)> = cached
             .get("chains")
             .and_then(Value::as_array)
@@ -872,64 +1704,56 @@ impl WalletBackendModule for WalletBackendModuleImpl {
                     .collect()
             })
             .unwrap_or_default();
-        // Pass 2: per chain, attach decimals (token_list) to the held tokens → the
-        // uniswap price-request JSON.
-        let preps: Vec<(u64, String)> = chain_data
+
+        // One task per chain, and each task is now a two-step CHAIN rather than a
+        // single call: `token_list.get_tokens` for the decimals (which the price
+        // request cannot be built without), then `uniswap.get_prices` over the
+        // held tokens. The second call is issued from the first one's callback,
+        // so nothing here depends on reply order; the tasks themselves overlap,
+        // and `gather` collects them into their own slots.
+        //
+        // The token metadata is kept as well as used: `get_market` reads it back
+        // to label the holdings, which is the call it used to make itself.
+        let tasks: Vec<GatherTask<MarketLeg>> = chain_data
             .into_iter()
             .map(|(chain_id, toks)| {
-                let meta = self.token_meta(chain_id as i64);
-                let held: Vec<Value> = toks
-                    .iter()
-                    .filter_map(|t| {
-                        let addr = t.get("address").and_then(Value::as_str)?;
-                        let bal = t.get("balance").and_then(Value::as_str).unwrap_or("0");
-                        if addr.is_empty() || parse_u256_str(bal).is_zero() {
-                            return None;
-                        }
-                        let dec = meta.get(&addr.to_lowercase()).map(|m| m.1).unwrap_or(18);
-                        Some(json!({ "address": addr, "decimals": dec }))
-                    })
-                    .collect();
-                (chain_id, json!({ "tokens": held }).to_string())
-            })
-            .collect();
-        let cache = {
-            let st = match self.st() {
-                Ok(s) => s,
-                Err(_) => return false,
-            };
-            Arc::clone(&st.market_prices)
-        };
-
-        // One concurrent uniswap.get_prices per chain (uniswap is concurrency:"multi",
-        // so they overlap). Fire-and-return; the final completion caches the prices
-        // and emits market_updated. get_market then reads the cache.
-        let tasks: Vec<GatherTask<(u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>)>> = preps
-            .into_iter()
-            .map(|(chain_id, req)| {
-                let t: GatherTask<(u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>)> =
-                    Box::new(move |done| {
+                let t: GatherTask<MarketLeg> = Box::new(move |done| {
+                    modules().token_list_module.get_tokens_async(chain_id as i64, move |res| {
+                        let meta = decode_token_meta(res.ok());
+                        let held: Vec<Value> = toks
+                            .iter()
+                            .filter_map(|t| {
+                                let addr = t.get("address").and_then(Value::as_str)?;
+                                let bal = t.get("balance").and_then(Value::as_str).unwrap_or("0");
+                                if addr.is_empty() || parse_u256_str(bal).is_zero() {
+                                    return None;
+                                }
+                                let dec = meta.get(&addr.to_lowercase()).map(|m| m.1).unwrap_or(18);
+                                Some(json!({ "address": addr, "decimals": dec }))
+                            })
+                            .collect();
+                        let req = json!({ "tokens": held }).to_string();
                         modules().uniswap_module.get_prices_async(chain_id as i64, &req, move |res| {
-                            done((chain_id, decode_uniswap_prices(res.ok())));
+                            done((chain_id, meta, decode_uniswap_prices(res.ok())));
                         });
                     });
+                });
                 t
             })
             .collect();
 
         let addr = address;
-        gather(
-            tasks,
-            move |results: Vec<(u64, std::collections::HashMap<String, (Option<f64>, Option<f64>)>)>| {
-                {
-                    let mut c = cache.lock().unwrap();
-                    for (chain, prices) in results {
-                        c.insert(chain, prices);
-                    }
+        gather(tasks, move |results: Vec<MarketLeg>| {
+            {
+                let mut prices = prices_cache.lock().unwrap();
+                let mut meta = meta_cache.lock().unwrap();
+                for (chain, chain_meta, chain_prices) in results {
+                    prices.insert(chain, chain_prices);
+                    meta.insert(chain, chain_meta);
                 }
-                emit_market_updated(&addr);
-            },
-        );
+            }
+            emit_market_updated(&addr);
+        });
         true
     }
 
@@ -951,75 +1775,26 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn estimate_fee(&mut self, send_json: String) -> String {
-        let p: SendParams = match serde_json::from_str(&send_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        // Delegated to fee_module. The gas limit was hardcoded 21_000 / 90_000
-        // here, which is right for a bare transfer and wrong for any ERC-20 that
-        // does more than move a balance -- so hand fee_module the actual call
-        // and let it run estimate_gas. Without a `tx` it has nothing to measure
-        // and correctly returns 0, which is how this first shipped.
-        let tx = match parse_addr(&p.to) {
-            Ok(to_addr) => {
-                if p.token_address.is_empty() {
-                    json!({ "from": p.from, "to": p.to,
-                            "value": format!("0x{:x}", parse_u256_str(&p.amount)) })
-                } else {
-                    let data = txbuild::erc20_transfer_calldata(to_addr, parse_u256_str(&p.amount));
-                    json!({ "from": p.from, "to": p.token_address,
-                            "data": format!("0x{}", hex::encode(data)) })
-                }
-            }
-            // An unparseable recipient is the caller's problem, not a reason to
-            // refuse a fee quote: fall back to no tx and report gasLimit 0.
-            Err(_) => Value::Null,
-        };
-        let mut fee_req = json!({
-            "tier": p.tier.clone().unwrap_or_else(|| "normal".into()),
-            "maxFeePerGas": p.max_fee_per_gas.clone(),
-            "maxPriorityFeePerGas": p.max_priority_fee_per_gas.clone(),
-            "gasLimit": p.gas_limit.clone(),
-        });
-        if !tx.is_null() {
-            fee_req["tx"] = tx;
-        }
-        match modules().fee_module.estimate(p.chain_id as i64, &fee_req.to_string()) {
-            Ok(s) => s,
-            Err(e) => err(e),
-        }
+        answer(plan_estimate_fee(&send_json), "start_estimate_fee")
     }
 
     fn send_native(&mut self, send_json: String) -> String {
-        let p: SendParams = match serde_json::from_str(&send_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        match self.do_send(&p, None) {
-            Ok(v) => v.to_string(),
+        match self.plan_send_native(&send_json) {
+            Ok(flow) => answer(flow, "start_send_native"),
             Err(e) => err(e),
         }
     }
 
     fn send_erc20(&mut self, send_json: String) -> String {
-        let p: SendParams = match serde_json::from_str(&send_json) {
-            Ok(p) => p,
-            Err(e) => return err(e),
-        };
-        let token = match parse_addr(&p.token_address) {
-            Ok(a) => a,
-            Err(e) => return err(e),
-        };
-        let amount = parse_u256_str(&p.amount);
-        match self.do_send(&p, Some((token, amount))) {
-            Ok(v) => v.to_string(),
+        match self.plan_send_erc20(&send_json) {
+            Ok(flow) => answer(flow, "start_send_erc20"),
             Err(e) => err(e),
         }
     }
 
     fn send_status(&mut self, request_id: String) -> String {
-        match self.job_status(&request_id) {
-            Ok(v) => v.to_string(),
+        match self.plan_send_status(&request_id) {
+            Ok(flow) => answer(flow, "start_send_status"),
             Err(e) => err(e),
         }
     }
@@ -1032,63 +1807,69 @@ impl WalletBackendModule for WalletBackendModuleImpl {
     }
 
     fn refresh_tx_status(&mut self, hash_hex: String, chain_id: i64) -> String {
-        let receipt = match modules().eth_rpc_module.get_transaction_receipt(chain_id, &hash_hex) {
-            Ok(s) => s,
-            Err(e) => return err(e),
-        };
-        let v = match ok_value(receipt) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        // null result => still pending
-        let status = match v.get("result") {
-            Some(Value::Null) | None => "pending",
-            Some(r) => {
-                if r.get("status").and_then(Value::as_str) == Some("0x1") {
-                    "confirmed"
-                } else {
-                    "failed"
-                }
-            }
-        };
-        // update the owning account's record (search all known history files is
-        // overkill; the UI passes the address-scoped call separately if needed).
-        if status != "pending" {
-            if let Ok(st) = self.st() {
-                // best-effort: update across the sender's file when present
-                for entry in std::fs::read_dir(st.dir.join("history")).into_iter().flatten().flatten() {
-                    if let Some(name) = entry.file_name().to_str().and_then(|n| n.strip_suffix(".json")) {
-                        if st.history.update_status(name, &hash_hex, status) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        emit_tx_status_changed(&hash_hex);
-        json!({ "ok": true, "status": status }).to_string()
+        answer(self.plan_refresh_tx_status(hash_hex, chain_id), "start_refresh_tx_status")
     }
-}
 
-impl WalletBackendModuleImpl {
-    /// Persist an address->label from a keystore reply, and pass the reply on
-    /// unchanged. Import is the only caller left: creating an account became
-    /// Tier D and left this module's contract with it.
-    fn label_imported_account(&mut self, keystore_reply: String, label: String) -> String {
-        let v = match ok_value(keystore_reply.clone()) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
-        if let Some(addr) = v.get("address").and_then(Value::as_str) {
-            if let Ok(st) = self.st() {
-                let p = st.dir.join("labels.json");
-                let mut labels: std::collections::HashMap<String, String> =
-                    std::fs::read_to_string(&p).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-                labels.insert(addr.to_lowercase(), label);
-                let _ = std::fs::write(p, serde_json::to_string_pretty(&labels).unwrap_or_default());
-            }
+    // ── the async spelling ──────────────────────────────────────────────────
+
+    fn start_test_endpoint(&mut self, chain_id: i64) -> String {
+        start_flow(plan_test_endpoint(chain_id))
+    }
+
+    fn start_import_mnemonic(&mut self, phrase_json: String, label: String) -> String {
+        start_flow(self.plan_import_mnemonic(phrase_json, label))
+    }
+
+    fn start_list_accounts(&mut self) -> String {
+        start_flow(plan_list_accounts())
+    }
+
+    fn start_get_tokens(&mut self, chain_id: i64) -> String {
+        start_flow(plan_get_tokens(chain_id))
+    }
+
+    fn start_add_custom_token(&mut self, token_json: String) -> String {
+        start_flow(plan_add_custom_token(token_json))
+    }
+
+    fn start_estimate_fee(&mut self, send_json: String) -> String {
+        start_flow(plan_estimate_fee(&send_json))
+    }
+
+    fn start_send_native(&mut self, send_json: String) -> String {
+        match self.plan_send_native(&send_json) {
+            Ok(flow) => start_flow(flow),
+            Err(e) => err(e),
         }
-        keystore_reply
+    }
+
+    fn start_send_erc20(&mut self, send_json: String) -> String {
+        match self.plan_send_erc20(&send_json) {
+            Ok(flow) => start_flow(flow),
+            Err(e) => err(e),
+        }
+    }
+
+    fn start_send_status(&mut self, request_id: String) -> String {
+        match self.plan_send_status(&request_id) {
+            Ok(flow) => start_flow(flow),
+            Err(e) => err(e),
+        }
+    }
+
+    fn start_refresh_tx_status(&mut self, hash_hex: String, chain_id: i64) -> String {
+        start_flow(self.plan_refresh_tx_status(hash_hex, chain_id))
+    }
+
+    fn take_result(&mut self, job_id: String) -> String {
+        match JOBS.take(&job_id) {
+            Job::Ready(answer) => answer,
+            Job::Pending => json!({ "ok": false, "pending": true, "jobId": job_id }).to_string(),
+            Job::Unknown => err(format!(
+                "unknown job '{job_id}': never started, already collected, or evicted after {} newer ones",
+                jobs::CAPACITY
+            )),
+        }
     }
 }
 
