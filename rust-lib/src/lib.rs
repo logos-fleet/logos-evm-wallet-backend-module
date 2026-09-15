@@ -2,12 +2,14 @@
 //!
 //! Holds the central proxy + chain config, fetches multi-chain balances via
 //! Multicall3, orchestrates send (build → sign → broadcast → persist), and stores
-//! this wallet's own transaction history. The pure pieces (`txbuild`) are
-//! unit-tested with `cargo test --no-default-features`; the cross-module
-//! orchestration glue is behind the default `logos_module` feature.
+//! this wallet's own transaction history. The pure pieces (`txbuild`, `config`,
+//! `history`, `jobs`) are unit-tested with `cargo test --no-default-features`;
+//! the cross-module orchestration glue is behind the default `logos_module`
+//! feature.
 
 mod config;
 mod history;
+pub mod jobs;
 mod txbuild;
 
 pub use config::*;

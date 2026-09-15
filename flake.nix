@@ -111,5 +111,57 @@
       # `configFor` is the per-target resolution of the same document; this
       # module has no `platforms` overlay, so the two agree everywhere.
       inherit (module) config configFor;
+
+      # ── THE `web` (wasm) VARIANT, AND THE CHECK THAT DRIVES IT ─────────────
+      #
+      # `packages.<system>.web` is an emscripten image with the module's crate,
+      # logos-protocol's wasm subset and a Wasm host linked into it — the form
+      # this module takes in a webview, where there is no dlopen and no host to
+      # dlopen into (ADR 0003). It exists for a module with FIVE dependencies
+      # only because logos-protocol's wasm subset now implements the outbound
+      # half of the C ABI (`lp_client_create` / `lp_invoke_async`), which is what
+      # logos-module-builder's gate reads off the pin (`hasOutboundDoor`,
+      # ADR 0009 gate 2).
+      #
+      # WHAT MADE THIS ONE WORK IS NOT A SPELLING CHANGE (#168). Every outbound
+      # call site is now a `Flow` — a state machine over `Call` values, driven
+      # with the synchronous clients on a native host and with the `_async` ones
+      # here. `send_native` is FOUR calls, each issued from the previous one's
+      # callback, and `send_status` is another four; a synchronous twin of either
+      # is not a spelling a wasm image can have, because a Worker is a single
+      # event loop with no ASYNCIFY (ADR 0004) and a call that blocked for its
+      # reply would deadlock the loop that delivers it. That is why every waiting
+      # method refuses on this target and names its `start_*` twin, and why
+      # `start_*` + `take_result` is the shape the platform actually has.
+      #
+      # Keyed by `systems`: a check is BUILT and RUN here, so a cross target
+      # would have nothing to run it on.
+      #
+      # A SKIP THAT SAYS SO when the builder publishes no `web` output for this
+      # module — a pin whose logos-protocol has no wasm outbound door, or one
+      # from before the builder could compile a Rust core to wasm32 at all. That
+      # is a pin rollout, not a defect, and an absent check would be a green run
+      # with a silently missing test.
+      checks = nixpkgs.lib.genAttrs systems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          modulePkgs = module.packages.${system};
+        in {
+          web-variant =
+            if modulePkgs ? web
+            then import ./nix/web-variant-test.nix { inherit pkgs; webVariant = modulePkgs.web; }
+            else pkgs.runCommand "wallet-backend-web-variant-tests-skipped" { } ''
+              echo "SKIP: web-variant -- this pin publishes no \`web\` output for"
+              echo "      wallet_backend_module. A module with dependencies gets one"
+              echo "      only when logos-protocol's wasm subset carries the outbound"
+              echo "      door (hasOutboundDoor). Force the workspace flake, whose"
+              echo "      pins do carry it -- a bare --auto-local on a clean tree"
+              echo "      builds this module's own lock and lands back here:"
+              echo "        ws test logos-evm-wallet-backend-module \"
+              echo "             --local logos-evm-wallet-backend-module"
+              mkdir -p $out
+              echo skipped > $out/result
+            '';
+        });
     };
 }

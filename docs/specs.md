@@ -159,9 +159,45 @@ cdylib plugin by the C++ `logos_module()` CMake macro.
 
 ## 3. Communication with dependencies
 
-The coordinator never talks to a chain or a key directly — it composes its four
+The coordinator never talks to a chain or a key directly — it composes its five
 dependencies. The richest flows are the **send pipeline**, the **concurrent
 balance fan-out**, the **chain-config push-down**, and the **market fan-out**.
+
+### 3.0 One flow, two drivers (and what a `web` image must call)
+
+Every outbound call site is a `Flow`: a state machine over `Call` values that
+names one call at a time and consumes its reply. It is written once and driven
+two ways.
+
+| Driver | Where | How |
+|---|---|---|
+| `run_waiting` | native only | Issues each call with the SYNCHRONOUS generated client, in a loop, and answers directly. |
+| `drive` | everywhere | Issues each call with the `_async` client and re-enters from the callback; parks the answer on the job board. |
+
+That gives every outbound method two spellings:
+
+| Spelling | Answers | Available |
+|---|---|---|
+| `<method>` | the result | native only. On a `web` image it dispatches **nothing** and answers `{ok:false, error:"... use start_<method>, then take_result"}`. |
+| `start_<method>` | `{ok, jobId}` at once | everywhere — and the only spelling a `web` image can use. |
+| `take_result(jobId)` | `{ok:false, pending:true}`, then the answer **once** | everywhere. |
+
+**Why the native path is not also async.** `uniswap_module` (#167) rewrote its one
+call site to "dispatch async, then wait on a channel". It can, because it is
+`concurrency: "multi"`: its dispatch runs on a worker QThread while the
+completion is marshalled onto the consumer's owner thread, so the thread that
+waits is never the thread that must deliver. This module is
+`concurrency: "single"` — dispatch **is** the Qt main thread — so the same
+rewrite would deadlock every method it touched.
+
+**Why a `web` image cannot wait.** A Worker is a single event loop with no
+ASYNCIFY (ADR 0004), so a call that blocked for its reply would deadlock the
+loop that delivers it. `logos-rust-sdk` compiles no synchronous client there at
+all, which is why a missed call site is a compile error in this crate rather
+than an undefined symbol at `wasm-ld`.
+
+The `web` image and the check that drives it end to end against stubbed
+dependencies live in `nix/web-variant-test.nix` + `nix/web-variant-drive.js`.
 
 ### 3.1 Chain-config push-down (on context-ready and on every config change)
 
@@ -186,6 +222,22 @@ sequenceDiagram
 `push_chain_configs` runs at startup (`on_context_ready`) and after every
 `set_chains` / `set_proxy_config`, so eth-rpc always reflects the central policy.
 This is how the wallet's proxy policy reaches the network layer.
+
+On a `web` image the same push happens on the module's **first dispatch** rather
+than in `on_context_ready`, and the configs are sent one at a time, each from the
+last one's callback. Both are forced by the target:
+
+* the hook fires at module load — "as soon as the host has delivered both the
+  context and the event plumbing" — and the wasm host installs the OUTBOUND DOOR
+  after that (`logos_wasm_host.cpp`'s `main()` calls
+  `logos::wasm::setOutboundConnection` several lines below
+  `logos_module_set_context`). A call made in between finds no connection and is
+  refused inline, with nothing on the wire, so eth-rpc would never learn the
+  endpoints at all;
+* the door has no in-flight de-duplication (`wasm_lp_abi.cpp`,
+  `lp_invoke_async`), so six configs fired at once would all find the token store
+  empty and all run the `capability_module.requestModule` handshake. Issued one
+  at a time, there is exactly one.
 
 ### 3.2 Send pipeline — `send_native` / `send_erc20` (`do_send`)
 
@@ -260,21 +312,20 @@ sequenceDiagram
   participant UNI as uniswap_module (concurrency:multi)
 
   Caller->>WB: refresh_market(address)
-  WB->>WB: read cached balances; pick held tokens (balance > 0) per chain
-  loop per chain
-    WB->>TL: get_tokens(chainId)  %% decimals/symbol metadata
-    TL-->>WB: { tokens:[{address,symbol,decimals}] }
-  end
-  WB->>G: one async task per chain → uniswap.get_prices_async
+  WB->>WB: read cached balances; pick the chains with holdings
+  WB->>G: one async task per chain (each is a 2-step chain)
   WB-->>Caller: true (returns immediately)
-  par concurrent (uniswap is multi)
+  par concurrent (token_list, then uniswap which is multi)
+    G->>TL: get_tokens_async(chain1)  %% decimals/symbol metadata
+    TL-->>G: { tokens:[{address,symbol,decimals}] }
     G->>UNI: get_prices_async(chain1, {tokens:[{address,decimals}]})
+    G->>TL: get_tokens_async(chainN)
+    TL-->>G: ...
     G->>UNI: get_prices_async(chainN, ...)
   end
   UNI-->>G: { prices:[{address, eth, usd}] }
-  G->>WB: cache market_prices (ephemeral); emit market_updated(address)
+  G->>WB: cache market_prices AND token_meta (both ephemeral); emit market_updated(address)
   Caller->>WB: get_market(address)
-  WB->>TL: get_tokens(chainId) (symbol/decimals)
   WB-->>Caller: { ok, address, chains:[{chainId, items:[{symbol, balance, usd, valueUsd, ...}]}] }
 ```
 
@@ -282,6 +333,15 @@ sequenceDiagram
 `get_market` then reads that cache, joins it with cached balances + token-list
 metadata, and computes `valueUsd` per holding (degrading to `null` prices on
 failure — the holding still shows).
+
+The token metadata is now **cached by the fan-out** rather than fetched again by
+`get_market`. It is the same answer `refresh_market` already had to have before
+it could build a price request, and asking for it twice made `get_market` a
+method that waited for one call per chain. Reading the cache makes `get_market`
+entirely offline, on every target. Its per-chain leg is therefore a two-step
+chain — `token_list.get_tokens_async`, then `uniswap.get_prices_async` from its
+callback — and the legs themselves still overlap; `gather` collects them into
+their own slots, so nothing depends on which chain answers first.
 
 ### 3.5 Other passthroughs
 
@@ -294,6 +354,11 @@ failure — the holding still shows).
 | `add_custom_token` | `token_list_module.add_custom_token(token_json)` |
 | `test_endpoint` | `eth_rpc_module.verify_chain_id(chainId)` (passthrough) |
 | `refresh_tx_status` | `eth_rpc_module.get_transaction_receipt(chainId, hash)` |
+
+Each of these has a `start_*` twin that answers a job id instead of waiting; see
+§3.0. `add_custom_token` is the one whose waiting spelling cannot carry a
+refusal — it returns a bare `bool`, so on a `web` image it answers `false` and
+`start_add_custom_token` answers `{ok:true, added:<bool>}`.
 
 ---
 
