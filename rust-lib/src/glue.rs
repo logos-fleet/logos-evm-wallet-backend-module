@@ -749,7 +749,7 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        self.label_new_account(resp, label)
+        self.label_imported_account(resp, label)
     }
 
     fn list_accounts(&mut self) -> String {
@@ -1071,8 +1071,10 @@ impl WalletBackendModule for WalletBackendModuleImpl {
 }
 
 impl WalletBackendModuleImpl {
-    /// Persist an address->label after the keystore creates/imports it.
-    fn label_new_account(&mut self, keystore_reply: String, label: String) -> String {
+    /// Persist an address->label from a keystore reply, and pass the reply on
+    /// unchanged. Import is the only caller left: creating an account became
+    /// Tier D and left this module's contract with it.
+    fn label_imported_account(&mut self, keystore_reply: String, label: String) -> String {
         let v = match ok_value(keystore_reply.clone()) {
             Ok(v) => v,
             Err(e) => return err(e),

@@ -364,6 +364,23 @@ contains a `chainId` field. Errors surface as `{"ok": false, "error": ...}`.
 
 ### 4.2 Accounts (signing stays in the keystore)
 
+Importing a key is **Tier D** in the keystore: it belongs to the **custodian**, whose
+built-in default is `evm_keystore_ui`. Nothing names this module a custodian on its
+behalf, so a deployment that wants `import_mnemonic` to work must say so first:
+
+```bash
+logoscore call keystore_module configure '{ "approvers": "evm_signer_ui", "custodians": "wallet_backend_module" }'
+```
+
+`configure` is **total** — a role the document does not name is held by nobody, not left
+at its default — so the document names the full set every time. Both doc-tests run this
+step before importing; without it the import is refused as not authorized.
+
+There is no `create_account` here. Account *creation* left this contract with the same
+Tier D move: a wallet backend requests signatures and reads which accounts exist, and a
+method that existed only to answer "not authorized" is worse than no method. `wallet_ui`
+calls `keystore_module.create_unrelated_account` directly instead.
+
 #### `import_mnemonic(phrase_json: String, label: String) -> String`
 Import an account from a BIP-39 mnemonic. `phrase_json` is forwarded to
 `keystore_module.import_mnemonic`; the doc-test uses the shape:
