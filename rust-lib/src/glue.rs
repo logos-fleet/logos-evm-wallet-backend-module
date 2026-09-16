@@ -1108,19 +1108,19 @@ impl Flow for StatusFlow {
 }
 
 impl WalletBackendModuleImpl {
+    /// The initialized state, or the error every method reports when the
+    /// context was never delivered.
+    ///
+    /// AN ACCESSOR AND NOTHING MORE. On `web` it also pushed the chain configs,
+    /// behind a `configs_sent` flag, because the wasm host installed the
+    /// outbound door AFTER the setters that fire `on_context_ready` -- so the
+    /// load-time send was refused inline with nothing on the wire. The host
+    /// opens the door first since logos-workspace#195 and the hook sends them
+    /// on every target again.
     fn st(&mut self) -> std::result::Result<&mut State, String> {
-        let st = self
-            .state
+        self.state
             .as_mut()
-            .ok_or_else(|| "backend not initialized (context not ready)".to_string())?;
-
-        // THE CHAIN CONFIGS USED TO BE SENT FROM HERE on `web`, behind a
-        // `configs_sent` flag, because the wasm host installed the outbound door
-        // AFTER the setters that fire `on_context_ready` -- so the load-time
-        // send was refused inline with nothing on the wire. The host opens the
-        // door first now (logos-workspace#195), the hook sends them on every
-        // target again, and this accessor is back to being an accessor.
-        Ok(st)
+            .ok_or_else(|| "backend not initialized (context not ready)".to_string())
     }
 
     fn save_watched(st: &State) {

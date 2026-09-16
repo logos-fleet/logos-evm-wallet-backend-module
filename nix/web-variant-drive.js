@@ -238,7 +238,6 @@ function drainStartupConfigs(image, grant) {
     fail('on_context_ready put NOTHING on the wire: the outbound door was not '
          + 'open when the hook fired', a.heard);
   }
-  const chains = a.json('get_chains', []);
   if (startup.configs < 2) {
     fail('startup configured ' + startup.configs + ' chains; the seeded default set '
          + 'is larger than that, so the config store did not load');
@@ -248,6 +247,8 @@ function drainStartupConfigs(image, grant) {
          + 'the outbound door has no in-flight de-duplication, so the configs must be '
          + 'issued one at a time');
   }
+  // ...and the module agrees with what it put on the wire.
+  const chains = a.json('get_chains', []);
   if (!chains.ok || (chains.chains || []).length !== startup.configs) {
     fail('the image configured ' + startup.configs + ' chains in eth_rpc but reports '
          + JSON.stringify((chains.chains || []).length));
