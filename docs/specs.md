@@ -223,21 +223,20 @@ sequenceDiagram
 `set_chains` / `set_proxy_config`, so eth-rpc always reflects the central policy.
 This is how the wallet's proxy policy reaches the network layer.
 
-On a `web` image the same push happens on the module's **first dispatch** rather
-than in `on_context_ready`, and the configs are sent one at a time, each from the
-last one's callback. Both are forced by the target:
+On a `web` image the push happens in `on_context_ready` too, but the configs go
+out one at a time, each from the last one's callback. That is forced by the
+target: the outbound door has no in-flight de-duplication (`wasm_lp_abi.cpp`,
+`lp_invoke_async`), so six configs fired at once would all find the token store
+empty and all run the `capability_module.requestModule` handshake. Issued one at
+a time, there is exactly one.
 
-* the hook fires at module load — "as soon as the host has delivered both the
-  context and the event plumbing" — and the wasm host installs the OUTBOUND DOOR
-  after that (`logos_wasm_host.cpp`'s `main()` calls
-  `logos::wasm::setOutboundConnection` several lines below
-  `logos_module_set_context`). A call made in between finds no connection and is
-  refused inline, with nothing on the wire, so eth-rpc would never learn the
-  endpoints at all;
-* the door has no in-flight de-duplication (`wasm_lp_abi.cpp`,
-  `lp_invoke_async`), so six configs fired at once would all find the token store
-  empty and all run the `capability_module.requestModule` handshake. Issued one
-  at a time, there is exactly one.
+It was not always so. Until logos-workspace#195 the wasm host installed the
+outbound door AFTER the setters that fire the hook, so a call made there found no
+connection and was refused inline with nothing on the wire — eth-rpc never
+learned the endpoints. This module deferred the push to its first dispatch to
+work around it. The host opens the door before it wakes the module now, the
+workaround is gone, and `nix/web-variant-drive.js` drains the load-time frames
+BEFORE it dispatches anything, so a regression fails there.
 
 ### 3.2 Send pipeline — `send_native` / `send_erc20` (`do_send`)
 
