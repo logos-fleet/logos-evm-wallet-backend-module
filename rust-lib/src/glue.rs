@@ -453,13 +453,6 @@ struct State {
     /// and the UI drives it forward with `send_status`. Behind an `Arc<Mutex<_>>`
     /// for the reason `balances` is: the send flow's last step runs in a callback.
     jobs: JobMap,
-    /// Whether eth_rpc has been told about the configured chains yet.
-    ///
-    /// ONLY A `web` IMAGE HAS TO ASK. On a native host `on_context_ready` sends
-    /// the configs itself and this is set there and never read again; on wasm it
-    /// CANNOT, and the flag is what makes the first dispatch do it instead. See
-    /// [`WalletBackendModuleImpl::st`].
-    configs_sent: bool,
 }
 
 /// A transaction parked on a human: broadcast it and record it once approved.
@@ -1115,37 +1108,19 @@ impl Flow for StatusFlow {
 }
 
 impl WalletBackendModuleImpl {
+    /// The initialized state, or the error every method reports when the
+    /// context was never delivered.
+    ///
+    /// AN ACCESSOR AND NOTHING MORE. On `web` it also pushed the chain configs,
+    /// behind a `configs_sent` flag, because the wasm host installed the
+    /// outbound door AFTER the setters that fire `on_context_ready` -- so the
+    /// load-time send was refused inline with nothing on the wire. The host
+    /// opens the door first since logos-workspace#195 and the hook sends them
+    /// on every target again.
     fn st(&mut self) -> std::result::Result<&mut State, String> {
-        let st = self
-            .state
+        self.state
             .as_mut()
-            .ok_or_else(|| "backend not initialized (context not ready)".to_string())?;
-
-        // ── THE CHAIN CONFIGS, SENT ON THE FIRST DISPATCH RATHER THAN AT LOAD ──
-        //
-        // `on_context_ready` is where this belongs and where it happens on every
-        // other target. It cannot happen there in a `web` image: the hook fires
-        // AT MODULE LOAD, "as soon as the host has delivered both the context
-        // and the event plumbing" (the generated `install`), and the wasm host
-        // installs the OUTBOUND DOOR after that — `logos_wasm_host.cpp`'s main()
-        // does `logos_module_set_context` / `set_emit_callback` first and
-        // `logos::wasm::setOutboundConnection` several lines later. A call made
-        // in between finds no connection and is refused inline by
-        // `lp_invoke_async`, with nothing on the wire: eth_rpc would simply never
-        // learn the endpoints, and every balance read would go to a chain it has
-        // no RPC URL for.
-        //
-        // So on this target the send is deferred to the first dispatch, which is
-        // the earliest moment the door is certainly open. The ordering the native
-        // path guarantees is preserved — nothing this module does reaches eth_rpc
-        // without coming through here first.
-        #[cfg(target_os = "emscripten")]
-        if !st.configs_sent {
-            st.configs_sent = true;
-            Self::push_chain_configs(st);
-        }
-
-        Ok(st)
+            .ok_or_else(|| "backend not initialized (context not ready)".to_string())
     }
 
     fn save_watched(st: &State) {
@@ -1511,10 +1486,10 @@ impl WalletBackendModule for WalletBackendModuleImpl {
             market_prices,
             token_meta,
             jobs: Default::default(),
-            // On wasm the door is not open yet; `st()` sends them instead.
-            configs_sent: cfg!(not(target_os = "emscripten")),
         };
-        #[cfg(not(target_os = "emscripten"))]
+        // EVERY TARGET, FROM THE HOOK. A `web` image can call out from here
+        // since logos-workspace#195; the two spellings below differ only in
+        // whether there is a synchronous client to use.
         Self::push_chain_configs(&st);
         self.state = Some(st);
     }

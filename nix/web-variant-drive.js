@@ -170,11 +170,14 @@ function expectUnanswered(image, count, why) {
   }
 }
 
-// `on_context_ready` sends every seeded chain's endpoint to eth_rpc, and it runs
-// on the image's FIRST DISPATCH here rather than at load: the hook itself fires
-// before the wasm host installs the outbound door, so a call made in it would be
-// refused with nothing on the wire. The caller must therefore have made one call
-// before there is anything here to drain.
+// `on_context_ready` sends every seeded chain's endpoint to eth_rpc, AT LOAD.
+// The frames are therefore already on the wire when `spawn()` returns and this
+// is called before the image has been asked to do anything -- which is the
+// assertion, not an accident of ordering. The module used to defer the send to
+// its first dispatch because the wasm host installed the outbound door after the
+// setters that fire the hook, so a call made in it was refused inline with
+// nothing on the wire (logos-workspace#195); draining here is what would fail if
+// that ever came back.
 //
 // The emscripten spelling issues the configs one at a time, each from the last
 // one's callback, so with a grant this is ONE handshake followed by one
@@ -224,14 +227,17 @@ function drainStartupConfigs(image, grant) {
     if (!names.includes(want)) fail('the published interface is missing ' + want + ': ' + names);
   }
 
-  // ── ONE HANDSHAKE AT STARTUP, not one per seeded chain ────────────────────
+  // ── THE CONFIGS GO OUT AT LOAD, AND ONE HANDSHAKE CARRIES THEM ───────────
   //
-  // `get_chains` is the first dispatch, which is what runs `on_context_ready`
-  // and therefore what puts the startup config calls on the wire. It reads the
-  // module's own seeded state and needs no dependency, so the frames it
-  // provoked are all still unanswered when it returns.
-  const chains = a.json('get_chains', []);
+  // Nothing has been DISPATCHED to this image yet: `spawn` instantiates it and
+  // `hello`/`methods` above ask the transport, not the module. So every frame
+  // drained here was put on the wire by `on_context_ready`, from inside the
+  // host's main(). An empty drain is logos-workspace#195 returning.
   const startup = drainStartupConfigs(a, token('eth_rpc_module'));
+  if (startup.handshakes === 0 && startup.configs === 0) {
+    fail('on_context_ready put NOTHING on the wire: the outbound door was not '
+         + 'open when the hook fired', a.heard);
+  }
   if (startup.configs < 2) {
     fail('startup configured ' + startup.configs + ' chains; the seeded default set '
          + 'is larger than that, so the config store did not load');
@@ -241,12 +247,14 @@ function drainStartupConfigs(image, grant) {
          + 'the outbound door has no in-flight de-duplication, so the configs must be '
          + 'issued one at a time');
   }
+  // ...and the module agrees with what it put on the wire.
+  const chains = a.json('get_chains', []);
   if (!chains.ok || (chains.chains || []).length !== startup.configs) {
     fail('the image configured ' + startup.configs + ' chains in eth_rpc but reports '
          + JSON.stringify((chains.chains || []).length));
   }
-  console.log('PASS: the image serves wallet_backend_module, seeded ' + startup.configs
-              + ' chains and ran ONE capability handshake to configure them');
+  console.log('PASS: the image serves wallet_backend_module, configured ' + startup.configs
+              + ' seeded chains FROM on_context_ready and ran ONE capability handshake');
 
   // ── THE WAITING SPELLING IS REFUSED HERE, AND SAYS WHAT TO CALL INSTEAD ───
   //
@@ -466,9 +474,8 @@ function drainStartupConfigs(image, grant) {
   // leaves the target undialled, and the module hears about it in its own
   // callback rather than from whatever the far side happens to check.
   const b = await spawn();
-  // Its startup chain configs are refused first, and the chain stops there:
-  // one handshake, no `set_chain_config` frame at all.
-  b.json('get_chains', []);
+  // Its load-time chain configs are refused first, and the chain stops there:
+  // one refused handshake per chain, no `set_chain_config` frame at all.
   const refusedStartup = drainStartupConfigs(b, '');
   if (refusedStartup.configs !== 0) {
     fail('eth_rpc was configured ' + refusedStartup.configs + ' times without a token');
